@@ -1,0 +1,137 @@
+// Vexor — Prisma schema
+// Autonomous security analysis agent — Vexor.
+// Conversations, messages, findings, exploits, tool calls, and settings
+// are persisted server-side (Postgres) so they survive across browsers/devices
+// and across serverless invocations (Vercel's filesystem is not persistent,
+// so SQLite does not work there — see DATABASE_URL notes in README).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Vercel Postgres/Neon: use the pooled connection string for the app's
+  // normal query traffic, and the direct (non-pooled) one for migrations,
+  // since `prisma migrate`/`db push` can't run through a pgbouncer pool.
+  directUrl = env("DATABASE_URL_UNPOOLED")
+}
+
+model Conversation {
+  id          String    @id @default(cuid())
+  title       String    @default("New conversation")
+  pinned      Boolean   @default(false)
+  favorited   Boolean   @default(false)
+  archived    Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  messages    Message[]
+  findings    Finding[]
+  exploits    Exploit[]
+  toolCalls   ToolCall[]
+  tags        ConversationTag[]
+
+  @@index([updatedAt])
+  @@index([pinned])
+  @@index([favorited])
+  @@index([archived])
+}
+
+// User-defined tags for filtering conversations beyond search.
+// A simple join table — a conversation can have many tags, a tag name can
+// appear on many conversations. Tag names are lowercased + trimmed for de-dup.
+model ConversationTag {
+  id             String   @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  name           String   // lowercased tag name, e.g. "webapp", "jwt", "api"
+  color          String   @default("accent") // accent | cyan | warn | danger | ok
+  createdAt      DateTime @default(now())
+
+  @@unique([conversationId, name])
+  @@index([conversationId])
+  @@index([name])
+}
+
+model Message {
+  id             String   @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String   // 'user' | 'assistant' | 'tool' | 'system'
+  content        String   // markdown / text content
+  // Display-only metadata stored as JSON: { title?, kind?: 'thought'|'tool'|'error'|'text', toolName?, toolArgs?, durationMs? }
+  metadata       String   @default("{}")
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId])
+}
+
+model Finding {
+  id             String   @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  // Stable hash of category|type|value|location for de-dup
+  fingerprint    String
+  category       String   // credentials | api_keys | tokens | pii | exposed | endpoints
+  type           String   // human label e.g. "AWS access key id"
+  value          String   // full value
+  masked         String   // masked for at-a-glance display
+  location       String   @default("")
+  sourceTool     String   @default("")
+  severity       String   @default("info") // critical | high | medium | low | info
+  revealed       Boolean  @default(false)
+  falsePositive  Boolean  @default(false) // soft-delete: marked as not a real finding
+  createdAt      DateTime @default(now())
+
+  @@unique([conversationId, fingerprint])
+  @@index([conversationId])
+  @@index([category])
+  @@index([severity])
+  @@index([falsePositive])
+}
+
+model Exploit {
+  id                  String   @id @default(cuid())
+  conversationId      String
+  conversation        Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  // Stable hash of title|location (lowercased) for upsert/merge
+  fingerprint         String
+  title               String
+  severity            String   @default("medium") // critical | high | medium | low | info
+  status              String   @default("open") // open | remediated | verified
+  location            String   @default("")
+  exploitInstructions String   @default("")
+  exploitCode         String   @default("")
+  patchInstructions   String   @default("")
+  patchCode           String   @default("")
+  language            String   @default("")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@unique([conversationId, fingerprint])
+  @@index([conversationId])
+  @@index([severity])
+  @@index([status])
+}
+
+model ToolCall {
+  id             String   @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  name           String
+  arguments      String   @default("{}") // raw JSON string
+  output         String   @default("")   // truncated output for the catalog
+  durationMs     Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId])
+  @@index([name])
+}
+
+// Key-value settings store (provider, model, agent tunables, theme, etc.)
+model Setting {
+  key   String @id
+  value String
+}

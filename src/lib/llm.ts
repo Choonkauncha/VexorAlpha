@@ -1,0 +1,261 @@
+import ZAI from "z-ai-web-dev-sdk";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+export type ProviderId = "zai" | "openai" | "google" | "anthropic" | "openrouter";
+
+type Message = { role: "system" | "user" | "assistant"; content: string };
+
+export interface ProviderChunk {
+  content?: string;
+  reasoning?: string;
+}
+
+export class ProviderError extends Error {
+  constructor(
+    message: string,
+    public readonly provider: ProviderId,
+    public readonly status?: number,
+  ) {
+    super(message);
+    this.name = "ProviderError";
+  }
+
+  get isRateLimit(): boolean {
+    return this.status === 429 || /(?:status\s*)?429|rate.?limit|too many requests/i.test(this.message);
+  }
+}
+
+const DEFAULT_MODELS: Record<ProviderId, string> = {
+  zai: "glm-4.6",
+  openai: "gpt-4o-mini",
+  google: "gemini-3.8-flash",
+  anthropic: "claude-3-5-haiku-latest",
+  openrouter: "openai/gpt-4o-mini",
+};
+
+const PROVIDERS: ProviderId[] = ["zai", "openai", "google", "anthropic", "openrouter"];
+
+function env(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value || undefined;
+}
+
+function hasCredentials(provider: ProviderId): boolean {
+  if (provider === "zai") {
+    return [join(process.cwd(), ".z-ai-config"), join(homedir(), ".z-ai-config"), "/etc/.z-ai-config"].some(existsSync);
+  }
+  return Boolean(env({ openai: "OPENAI_API_KEY", google: "GOOGLE_API_KEY", anthropic: "ANTHROPIC_API_KEY", openrouter: "OPENROUTER_API_KEY" }[provider]));
+}
+
+function providerModel(provider: ProviderId, requested: string): string {
+  // Precedence: explicit per-provider env override > a model the caller
+  // explicitly asked for on THIS provider > this provider's own default.
+  // Callers must only pass `requested` when it was actually selected for
+  // `provider` — never carry a model name over to a fallback provider.
+  const envName = `${provider.toUpperCase()}_MODEL`;
+  return env(envName) || requested || DEFAULT_MODELS[provider];
+}
+
+export function providerOrder(preferred: string): ProviderId[] {
+  const requested = preferred as ProviderId;
+  const fallbackNames = (env("AI_PROVIDER_FALLBACKS") || env("PROVIDER_FALLBACKS") || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase() as ProviderId)
+    .filter((value, index, values) => PROVIDERS.includes(value) && values.indexOf(value) === index);
+  const candidates = [requested, ...fallbackNames, ...PROVIDERS].filter(
+    (value, index, values): value is ProviderId => PROVIDERS.includes(value as ProviderId) && values.indexOf(value) === index,
+  );
+  return candidates.filter(hasCredentials);
+}
+
+function parseSseBlock(block: string): any | null {
+  const line = block.split("\n").find((value) => value.startsWith("data: "));
+  if (!line) return null;
+  const payload = line.slice(6).trim();
+  if (!payload || payload === "[DONE]") return null;
+  try { return JSON.parse(payload); } catch { return null; }
+}
+
+async function* openAiCompatibleStream(
+  provider: ProviderId,
+  url: string,
+  apiKey: string,
+  model: string,
+  messages: Message[],
+  temperature: number | null,
+  signal?: AbortSignal,
+  extraHeaders: Record<string, string> = {},
+): AsyncGenerator<ProviderChunk> {
+  const response = await fetch(url, {
+    method: "POST",
+    signal,
+    headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json", ...extraHeaders },
+    body: JSON.stringify({ model, messages, stream: true, ...(temperature !== null ? { temperature } : {}) }),
+  });
+  if (!response.ok) throw new ProviderError(`${provider} request failed (${response.status}): ${await response.text()}`, provider, response.status);
+  if (!response.body) throw new ProviderError(`${provider} returned an empty response`, provider);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop() || "";
+    for (const block of blocks) {
+      const parsed = parseSseBlock(block);
+      const delta = parsed?.choices?.[0]?.delta;
+      if (delta?.reasoning_content || delta?.reasoning) yield { reasoning: delta.reasoning_content || delta.reasoning };
+      if (delta?.content) yield { content: delta.content };
+    }
+  }
+}
+
+async function* googleStream(
+  model: string,
+  messages: Message[],
+  temperature: number | null,
+  signal?: AbortSignal,
+): AsyncGenerator<ProviderChunk> {
+  const key = env("GOOGLE_API_KEY")!;
+  const base = env("GOOGLE_BASE_URL") || "https://generativelanguage.googleapis.com/v1beta";
+  const system = messages.find((message) => message.role === "system")?.content;
+  const contents = messages.filter((message) => message.role !== "system").map((message) => ({
+    role: message.role === "assistant" ? "model" : "user",
+    parts: [{ text: message.content }],
+  }));
+  const response = await fetch(`${base}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`, {
+    method: "POST",
+    signal,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
+      contents,
+      ...(temperature !== null ? { generationConfig: { temperature } } : {}),
+    }),
+  });
+  if (!response.ok) throw new ProviderError(`google request failed (${response.status}): ${await response.text()}`, "google", response.status);
+  if (!response.body) throw new ProviderError("google returned an empty response", "google");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop() || "";
+    for (const block of blocks) {
+      const parsed = parseSseBlock(block);
+      const parts = parsed?.candidates?.[0]?.content?.parts || [];
+      for (const part of parts) if (part.text) yield part.thought ? { reasoning: part.text } : { content: part.text };
+    }
+  }
+}
+
+async function* anthropicStream(
+  model: string,
+  messages: Message[],
+  thinkingBudget: number,
+  temperature: number | null,
+  signal?: AbortSignal,
+): AsyncGenerator<ProviderChunk> {
+  const key = env("ANTHROPIC_API_KEY")!;
+  const base = env("ANTHROPIC_BASE_URL") || "https://api.anthropic.com/v1";
+  const system = messages.find((message) => message.role === "system")?.content;
+  const response = await fetch(`${base}/messages`, {
+    method: "POST",
+    signal,
+    headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      max_tokens: Number(env("ANTHROPIC_MAX_TOKENS") || 8192),
+      ...(system ? { system } : {}),
+      messages: messages.filter((message) => message.role !== "system"),
+      stream: true,
+      ...(temperature !== null ? { temperature } : {}),
+      ...(thinkingBudget > 0 ? { thinking: { type: "enabled", budget_tokens: thinkingBudget } } : {}),
+    }),
+  });
+  if (!response.ok) throw new ProviderError(`anthropic request failed (${response.status}): ${await response.text()}`, "anthropic", response.status);
+  if (!response.body) throw new ProviderError("anthropic returned an empty response", "anthropic");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const blocks = buffer.split("\n\n");
+    buffer = blocks.pop() || "";
+    for (const block of blocks) {
+      const parsed = parseSseBlock(block);
+      const delta = parsed?.delta;
+      if (delta?.type === "thinking_delta") yield { reasoning: delta.thinking };
+      if (delta?.type === "text_delta") yield { content: delta.text };
+    }
+  }
+}
+
+export async function* createProviderStream(options: {
+  provider: ProviderId;
+  model: string;
+  messages: Message[];
+  thinkingBudget: number;
+  temperature: number | null;
+  signal?: AbortSignal;
+}): AsyncGenerator<ProviderChunk> {
+  const { provider, messages, thinkingBudget, temperature, signal } = options;
+  const model = providerModel(provider, options.model);
+
+  if (provider === "zai") {
+    const zai = await ZAI.create();
+    const completion = await zai.chat.completions.create({
+      model,
+      messages,
+      stream: true,
+      thinking: { type: thinkingBudget > 0 ? "enabled" : "disabled" },
+      ...(temperature !== null ? { temperature } : {}),
+    });
+    let buffer = "";
+    for await (const chunk of completion as AsyncIterable<any>) {
+      if (typeof chunk === "string" || Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) {
+        buffer += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+        const blocks = buffer.split("\n\n");
+        buffer = blocks.pop() || "";
+        for (const block of blocks) {
+          const parsed = parseSseBlock(block);
+          const delta = parsed?.choices?.[0]?.delta;
+          if (delta?.reasoning_content || delta?.reasoning) yield { reasoning: delta.reasoning_content || delta.reasoning };
+          if (delta?.content) yield { content: delta.content };
+        }
+      } else {
+        const delta = chunk?.choices?.[0]?.delta || chunk?.choices?.[0]?.message || {};
+        if (delta.reasoning_content || delta.reasoning) yield { reasoning: delta.reasoning_content || delta.reasoning };
+        if (delta.content) yield { content: delta.content };
+      }
+    }
+    return;
+  }
+
+  if (provider === "google") {
+    yield* googleStream(model, messages, temperature, signal);
+    return;
+  }
+  if (provider === "anthropic") {
+    yield* anthropicStream(model, messages, thinkingBudget, temperature, signal);
+    return;
+  }
+
+  const key = env(provider === "openai" ? "OPENAI_API_KEY" : "OPENROUTER_API_KEY")!;
+  const base = env(provider === "openai" ? "OPENAI_BASE_URL" : "OPENROUTER_BASE_URL") ||
+    (provider === "openai" ? "https://api.openai.com/v1" : "https://openrouter.ai/api/v1");
+  yield* openAiCompatibleStream(provider, `${base.replace(/\/$/, "")}/chat/completions`, key, model, messages, temperature, signal,
+    provider === "openrouter" ? { "HTTP-Referer": env("OPENROUTER_SITE_URL") || "", "X-Title": env("OPENROUTER_APP_NAME") || "Vexor" } : {});
+}

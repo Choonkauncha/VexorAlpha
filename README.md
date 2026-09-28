@@ -1,1 +1,1 @@
-# ZythosV2
+# Zythos
