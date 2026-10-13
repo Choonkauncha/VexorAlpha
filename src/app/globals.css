@@ -592,3 +592,18 @@ input[type="range"].vx-range::-moz-range-thumb {
   cursor: pointer;
   border: 2px solid var(--vx-panel);
 }
+
+/* Keep keyboard navigation visible and respect motion/accessibility preferences. */
+:where(button, a, input, textarea, select):focus-visible {
+  outline: 2px solid var(--vx-accent);
+  outline-offset: 3px;
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+footer { padding-bottom: env(safe-area-inset-bottom, 0px); }

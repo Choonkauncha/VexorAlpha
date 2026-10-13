@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
   try {
     const res = await runTool(name, args, settings.targetScope);
     const durationMs = Date.now() - started;
-    const out: { output: string; findings?: typeof import("@/lib/types").Finding[]; exploitFiled?: boolean; durationMs: number } = {
+    const out: { output: string; findings?: import("@/lib/types").Finding[]; exploitFiled?: boolean; durationMs: number } = {
       output: res.output,
       durationMs,
     };

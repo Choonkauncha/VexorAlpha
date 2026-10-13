@@ -1,38 +1,40 @@
 "use client";
 
+import { Target, FolderSearch, Code, BookOpen, KeyRound, ShieldCheck } from "lucide-react";
+
 const CHIPS = [
   {
-    icon: "🎯",
+    icon: Target,
     title: "Pentest a target",
     desc: "Full recon → exploit → patch",
     prompt: "Run a full defensive penetration test against this authorized target — enumerate the attack surface, harvest JS bundles, probe every endpoint, and deliver exploit + patch code:\n\nTarget: ",
   },
   {
-    icon: "🔍",
+    icon: FolderSearch,
     title: "Audit a repository",
     desc: "OWASP Top 10 + hotfixes",
     prompt: "Audit this repository for OWASP Top 10 vulnerabilities and generate hotfix patches:\n\nRepo: ",
   },
   {
-    icon: "🧬",
+    icon: Code,
     title: "Scan a code snippet",
     desc: "Injection & memory safety",
     prompt: "Scan the following code for injection, memory-safety, and input-validation flaws, then propose a patch:\n\n",
   },
   {
-    icon: "📖",
+    icon: BookOpen,
     title: "Explain a CVE",
     desc: "How it works & how to fix",
     prompt: "Explain CVE-2024-3094 (the xz backdoor): how it works, how to detect it, and how to remediate it.",
   },
   {
-    icon: "🎫",
+    icon: KeyRound,
     title: "Inspect a JWT",
     desc: "alg:none, weak secrets, expiry",
     prompt: "Decode and audit this JWT for alg:none, weak secrets, key-confusion, and missing expiry:\n\n",
   },
   {
-    icon: "🛡️",
+    icon: ShieldCheck,
     title: "Audit security headers",
     desc: "HSTS, CSP, cookies, leakage",
     prompt: "Audit the security headers of this authorized target (HSTS, CSP, X-Frame-Options, cookie flags, info leakage):\n\nTarget: ",
@@ -45,7 +47,7 @@ export function Landing({ onPick }: { onPick: (prompt: string) => void }) {
       <div className="absolute inset-0 vx-grid-bg pointer-events-none" />
       <div className="relative z-10 w-full max-w-3xl flex flex-col items-center text-center">
         <div className="vx-glow vx-orb-float w-20 h-20 rounded-full flex items-center justify-center text-4xl mb-6 border border-[color-mix(in_oklab,var(--vx-accent)_40%,transparent)] bg-[color-mix(in_oklab,var(--vx-accent)_10%,transparent)] vx-hero-rise">
-          🛡️
+          <ShieldCheck className="w-9 h-9 text-[var(--vx-accent)]" />
         </div>
         <h1 className="text-4xl sm:text-5xl font-bold tracking-tight vx-hero-rise" style={{ animationDelay: "0.08s" }}>
           <span className="text-[var(--vx-accent)] vx-text-glow">V</span>e
@@ -61,7 +63,7 @@ export function Landing({ onPick }: { onPick: (prompt: string) => void }) {
         <div className="mt-8 w-full grid grid-cols-1 sm:grid-cols-2 gap-2.5">
           {CHIPS.map((c, i) => (
             <button key={c.title} className="vx-chip vx-chip-in" style={{ animationDelay: `${0.3 + i * 0.06}s` }} onClick={() => onPick(c.prompt)}>
-              <span className="vx-chip-ic">{c.icon}</span>
+              <c.icon className="w-5 h-5 shrink-0 text-[var(--vx-accent)]" aria-hidden="true" />
               <span className="flex flex-col">
                 <span className="vx-chip-t">{c.title}</span>
                 <span className="vx-chip-d">{c.desc}</span>

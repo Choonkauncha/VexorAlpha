@@ -31,7 +31,7 @@ interface ChatState {
   exploits: Exploit[];
   streaming: boolean;
   thinking: boolean;
-  progress: { iteration: number; maxIterations: number } | null;
+  progress: { iteration: number; maxIterations: number; actionCount?: number } | null;
 
   setConversations: (c: ConversationSummary[]) => void;
   setActive: (id: string | null) => void;
@@ -44,7 +44,7 @@ interface ChatState {
   upsertExploit: (e: Exploit) => void;
   setStreaming: (s: boolean) => void;
   setThinking: (t: boolean) => void;
-  setProgress: (p: { iteration: number; maxIterations: number } | null) => void;
+  setProgress: (p: { iteration: number; maxIterations: number; actionCount?: number } | null) => void;
   reset: () => void;
 }
 
@@ -108,6 +108,8 @@ interface UIState {
   sidebarOpen: boolean;
   sidebarTab: "chats" | "recon" | "timeline" | "search" | "duplicates" | "history" | "tester" | "agent" | "stats" | "settings" | "cli";
   paletteOpen: boolean;
+  panelOpen: boolean;
+  setPanelOpen: (open: boolean) => void;
   setSidebarOpen: (o: boolean) => void;
   setSidebarTab: (t: UIState["sidebarTab"]) => void;
   setPaletteOpen: (o: boolean) => void;
@@ -117,8 +119,10 @@ export const useUIStore = create<UIState>((set) => ({
   sidebarOpen: false,
   sidebarTab: "chats",
   paletteOpen: false,
+  panelOpen: false,
+  setPanelOpen: (panelOpen) => set((s) => ({ panelOpen, sidebarTab: panelOpen && s.sidebarTab === "chats" ? "recon" : s.sidebarTab })),
   setSidebarOpen: (sidebarOpen) => set({ sidebarOpen }),
-  setSidebarTab: (sidebarTab) => set({ sidebarTab }),
+  setSidebarTab: (sidebarTab) => set({ sidebarTab, panelOpen: sidebarTab !== "chats" }),
   setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
 }));
 

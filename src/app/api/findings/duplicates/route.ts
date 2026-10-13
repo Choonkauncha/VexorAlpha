@@ -42,7 +42,12 @@ export async function GET() {
   }
 
   // Build duplicate groups: value appears in 2+ distinct conversations.
-  const groups = [];
+  const groups: {
+    value: string; masked: string; type: string; category: string; severity: string;
+    occurrenceCount: number; conversationCount: number;
+    occurrences: { findingId: string; conversationId: string; conversationTitle: string;
+      location: string; sourceTool: string; severity: string; createdAt: Date }[];
+  }[] = [];
   for (const [value, items] of byValue) {
     const convIds = new Set(items.map((f) => f.conversation.id));
     if (convIds.size < 2) continue;

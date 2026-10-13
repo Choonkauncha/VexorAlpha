@@ -17,6 +17,8 @@ export interface MessageMetadata {
   toolArgs?: string;
   durationMs?: number;
   footer?: string;
+  /** Client-only buffer used while rendering streaming text. */
+  _rawBuf?: string;
 }
 
 // Streaming event contract for the agent loop.

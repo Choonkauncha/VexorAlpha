@@ -4,7 +4,7 @@ import { useRef, useEffect } from "react";
 import { Send } from "lucide-react";
 
 interface ComposerProps {
-  onSend: (text: string) => void;
+  onSend: (text: string) => Promise<boolean>;
   onStop: () => void;
   streaming: boolean;
   placeholder?: string;
@@ -24,15 +24,14 @@ export function Composer({ onSend, onStop, streaming, placeholder, value, onChan
 
   const collapsed = streaming;
 
-  const submit = () => {
+  const submit = async () => {
     const text = value.trim();
     if (!text || streaming) return;
-    onSend(text);
-    onChange("");
+    if (await onSend(text)) onChange("");
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       submit();
     }
@@ -55,7 +54,7 @@ export function Composer({ onSend, onStop, streaming, placeholder, value, onChan
           style={{ background: "transparent", border: "none", boxShadow: "none", opacity: collapsed ? 0 : 1, height: collapsed ? 0 : undefined, overflow: "hidden" }}
         >
           <span>Vexor · defensive-security agent</span>
-          <span>↵ send · ⇧↦ newline · / focus</span>
+          <span>↵ send · ⇧↵ newline · / focus</span>
         </div>
 
         {/* Container — holds either the input or the spinning stop circle */}
@@ -71,6 +70,8 @@ export function Composer({ onSend, onStop, streaming, placeholder, value, onChan
             }}
           >
             <button
+              disabled={!streaming}
+              tabIndex={streaming ? 0 : -1}
               onClick={onStop}
               className="relative flex items-center justify-center rounded-full transition-all hover:scale-110"
               style={{
@@ -117,13 +118,15 @@ export function Composer({ onSend, onStop, streaming, placeholder, value, onChan
           >
             <span className="pl-3 pt-3 text-[var(--vx-accent)] vx-mono text-sm select-none">{">"}</span>
             <textarea
+              aria-label="Message"
+              disabled={streaming}
               ref={taRef}
               value={value}
               onChange={(e) => onChange(e.target.value)}
               onKeyDown={onKeyDown}
               rows={1}
               placeholder={placeholder || "Paste code, a repo URL, or a CVE id — press Enter to send, Shift+Enter for a newline"}
-              className="flex-1 bg-transparent border-0 outline-none resize-none vx-mono text-sm py-3 pr-2 placeholder:text-[var(--vx-text-muted)] vx-scroll"
+              className="flex-1 bg-transparent border-0 outline-none resize-none vx-mono text-base sm:text-sm py-3 pr-2 placeholder:text-[var(--vx-text-muted)] vx-scroll"
             />
             <button
               onClick={submit}

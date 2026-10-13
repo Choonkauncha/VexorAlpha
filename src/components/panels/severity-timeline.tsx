@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { TrendingUp, Critical, AlertTriangle, Info } from "lucide-react";
+import { TrendingUp, Info } from "lucide-react";
 
 interface DayBucket {
   date: string;

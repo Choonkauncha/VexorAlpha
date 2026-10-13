@@ -367,7 +367,7 @@ async function analyzeSecurityHeaders(args: { url: string }, scope: string): Pro
     lines.push("", "Cookie flags:");
     const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
     for (const c of cookies) {
-      const flags = [];
+      const flags: string[] = [];
       if (/secure/i.test(c)) flags.push("Secure");
       if (/httponly/i.test(c)) flags.push("HttpOnly");
       if (/samesite/i.test(c)) flags.push("SameSite");

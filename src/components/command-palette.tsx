@@ -20,11 +20,13 @@ export function CommandPalette({
   onDeleteActive,
   onExport,
   onPickConversation,
+  onToggleTheme,
 }: {
   onNewChat: () => void;
   onDeleteActive: () => void;
   onExport: () => void;
   onPickConversation: (id: string) => void;
+  onToggleTheme: () => void;
 }) {
   const open = useUIStore((s) => s.paletteOpen);
   const setOpen = useUIStore((s) => s.setPaletteOpen);
@@ -56,12 +58,7 @@ export function CommandPalette({
     setOpen(false);
   };
 
-  const toggleTheme = () => {
-    if (!settings) return;
-    patchSettings({ theme: settings.theme === "dark" ? "light" : "dark" });
-    fetch("/api/settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ theme: settings.theme === "dark" ? "light" : "dark" }) });
-    setOpen(false);
-  };
+  const toggleTheme = () => { onToggleTheme(); setOpen(false); };
 
   const actions: Action[] = [
     { id: "new", label: "New conversation", icon: Plus, group: "actions", run: () => { onNewChat(); setOpen(false); }, hint: "Ctrl+N" },
@@ -96,9 +93,9 @@ export function CommandPalette({
     : all;
 
   const groups: { id: Action["group"]; label: string; items: Action[] }[] = [
-    { id: "actions", label: "Actions", items: filtered.filter((a) => a.group === "actions") },
-    { id: "navigate", label: "Navigate", items: filtered.filter((a) => a.group === "navigate") },
-    { id: "conversations", label: "Conversations", items: filtered.filter((a) => a.group === "conversations") },
+    { id: "actions" as const, label: "Actions", items: filtered.filter((a) => a.group === "actions") },
+    { id: "navigate" as const, label: "Navigate", items: filtered.filter((a) => a.group === "navigate") },
+    { id: "conversations" as const, label: "Conversations", items: filtered.filter((a) => a.group === "conversations") },
   ].filter((g) => g.items.length);
 
   return (

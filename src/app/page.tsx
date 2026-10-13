@@ -25,6 +25,7 @@ import { SeverityTimeline } from "@/components/panels/severity-timeline";
 
 import { useChatStore, useSettingsStore, useUIStore } from "@/lib/store";
 import type { AgentEvent, AppSettings, ChatMessage } from "@/lib/types";
+import { apiJson } from "@/lib/client-api";
 import { DEFAULT_SETTINGS } from "@/lib/types";
 
 export default function Home() {
@@ -53,9 +54,11 @@ function AppShell() {
   } = useChatStore();
   const { sidebarOpen, setSidebarOpen, sidebarTab, setSidebarTab, paletteOpen, setPaletteOpen } = useUIStore();
 
+  const [bootError, setBootError] = useState<string | null>(null);
   const [composerValue, setComposerValue] = useState("");
   const [paletteKey, setPaletteKey] = useState(0);
-  const [showPanel, setShowPanel] = useState(false);
+  const showPanel = useUIStore((s) => s.panelOpen);
+  const setShowPanel = useUIStore((s) => s.setPanelOpen);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [thinkingFrame, setThinkingFrame] = useState(0);
@@ -63,33 +66,75 @@ function AppShell() {
   const thinkingReasoningRef = useRef("");
   const thinkingStartRef = useRef<number | null>(null);
 
+  const editingFromIndexRef = useRef<number | null>(null);
+  const selectionRef = useRef(0);
+  const lastDupeCountRef = useRef(0);
+
+  const refreshRecon = useCallback(async (convId: string) => {
+    try {
+      const r = await fetch(`/api/conversations/${convId}`);
+      if (!r.ok) return;
+      const data = await r.json();
+      if (useChatStore.getState().activeId !== convId) return;
+      // Merge: replace with server truth.
+      setFindings(data.findings || []);
+      setExploits(data.exploits || []);
+
+      // Check for cross-audit duplicates — toast if a new duplicate appeared.
+      try {
+        const dr = await fetch("/api/findings/duplicates");
+        const dj = await dr.json();
+        const newCount = (dj.groups || []).filter((g: any) =>
+          g.occurrences.some((o: any) => o.conversationId === convId)
+        ).length;
+        if (newCount > lastDupeCountRef.current && lastDupeCountRef.current !== -1 && newCount > 0) {
+          const delta = newCount - lastDupeCountRef.current;
+          toast.warning(`⚠ ${delta} finding${delta > 1 ? "s" : ""} match${delta > 1 ? "" : "es"} an existing cross-audit duplicate`, {
+            description: "Likely un-rotated credential — check the Dupes tab.",
+          });
+        }
+        lastDupeCountRef.current = newCount;
+      } catch {}
+    } catch {}
+  }, [setFindings, setExploits]);
+
   const refreshConversations = useCallback(async () => {
     try {
-      // Always fetch with includeArchived=1 so the sidebar can toggle visibility
-      // without an extra round-trip. The sidebar filters client-side.
-      const r = await fetch("/api/conversations?includeArchived=1");
-      const list = await r.json();
+      const list = await apiJson<import("@/lib/types").ConversationSummary[]>("/api/conversations?includeArchived=1");
+      if (!Array.isArray(list)) throw new Error("Unexpected conversation response.");
       setConversations(list);
-    } catch {}
+      return true;
+    } catch (error) {
+      setBootError(error instanceof Error ? error.message : "Unable to load conversations.");
+      return false;
+    }
   }, [setConversations]);
 
-  // ---------- boot: load settings + conversations ----------
-  useEffect(() => {
-    (async () => {
-      try {
-        const r = await fetch("/api/settings");
-        const s: AppSettings = await r.json();
-        setSettings({ ...DEFAULT_SETTINGS, ...s });
-      } catch {
-        setSettings(DEFAULT_SETTINGS);
-      }
-    })();
-    refreshConversations();
-  }, [refreshConversations]);
+  const loadWorkspace = useCallback(async () => {
+    const results = await Promise.all([
+      apiJson<AppSettings>("/api/settings").then((s) => {
+        setSettings({ ...DEFAULT_SETTINGS, ...s, runtime: { ...DEFAULT_SETTINGS.runtime, ...s.runtime } });
+        return true;
+      }).catch((error: Error) => {
+        setBootError(error.message);
+        return false;
+      }),
+      refreshConversations(),
+    ]);
+    if (results.every(Boolean)) setBootError(null);
+  }, [refreshConversations, setSettings]);
+
+  // Boot synchronizes with the server; all state updates occur after network responses.
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { void loadWorkspace(); }, [loadWorkspace]);
+  useEffect(() => () => { abortRef.current?.abort(); }, []);
 
   // ---------- actions ----------
   const newChat = useCallback(async () => {
-    if (streaming) return;
+    if (useChatStore.getState().streaming) return;
+    selectionRef.current++;
+    editingFromIndexRef.current = null;
+    setComposerValue("");
     reset();
     setMessages([]);
     refreshConversations();
@@ -97,7 +142,10 @@ function AppShell() {
 
   // Start a new chat from a template — resets the view + pre-fills the composer.
   const newChatFromTemplate = useCallback(async (template: PromptTemplate) => {
-    if (streaming) return;
+    if (useChatStore.getState().streaming) return;
+    selectionRef.current++;
+    editingFromIndexRef.current = null;
+    setComposerValue("");
     reset();
     setMessages([]);
     refreshConversations();
@@ -125,7 +173,7 @@ function AppShell() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "b") { e.preventDefault(); setSidebarOpen(!sidebarOpen); }
+      if ((e.metaKey || e.ctrlKey) && e.key === "b") { e.preventDefault(); setSidebarTab("chats"); setSidebarOpen(sidebarTab !== "chats" || !sidebarOpen); }
       if ((e.metaKey || e.ctrlKey) && e.key === "n") { e.preventDefault(); newChat(); }
       if ((e.metaKey || e.ctrlKey) && e.key === "k") { e.preventDefault(); openPalette(); }
       // "?" opens the shortcuts overlay — but not while typing in an input.
@@ -141,7 +189,7 @@ function AppShell() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [sidebarOpen, setSidebarOpen, openPalette, newChat]);
+  }, [sidebarOpen, sidebarTab, setSidebarTab, setSidebarOpen, openPalette, newChat]);
 
   // ---------- thinking animation ----------
   useEffect(() => {
@@ -163,61 +211,52 @@ function AppShell() {
   }, [messages, thinking]);
 
   const pickConversation = useCallback(async (id: string) => {
-    if (streaming) return;
+    if (useChatStore.getState().streaming) return;
+    const selection = ++selectionRef.current;
     try {
-      const r = await fetch(`/api/conversations/${id}`);
-      if (!r.ok) return;
-      const data = await r.json();
+      const data = await apiJson<{ messages: ChatMessage[]; findings: import("@/lib/types").Finding[]; exploits: import("@/lib/types").Exploit[] }>(`/api/conversations/${id}`);
+      if (selection !== selectionRef.current || useChatStore.getState().streaming) return;
+      editingFromIndexRef.current = null;
+      setComposerValue("");
       setActive(id);
       setMessages(data.messages || []);
       setFindings(data.findings || []);
       setExploits(data.exploits || []);
-      // Reset the duplicate counter so loading an existing conversation doesn't
-      // trigger a false "new duplicate" toast. Set to -1 so the first
-      // refreshRecon after this sets the baseline without toasting.
       lastDupeCountRef.current = -1;
-    } catch (e: any) {
-      toast.error("Failed to load conversation: " + e.message);
+      if (window.innerWidth < 1024) { setSidebarOpen(false); setShowPanel(false); }
+    } catch (error) {
+      toast.error("Failed to load conversation: " + (error as Error).message);
     }
-  }, [streaming, setActive, setMessages, setFindings, setExploits]);
+  }, [setActive, setMessages, setFindings, setExploits, setSidebarOpen, setShowPanel]);
 
   const deleteConversation = useCallback(async (id: string) => {
+    if (useChatStore.getState().streaming) { toast.info("Stop the current run before deleting a conversation."); return; }
+    if (!window.confirm("Delete this conversation and its saved findings? This cannot be undone.")) return;
     try {
-      await fetch(`/api/conversations/${id}`, { method: "DELETE" });
-      if (id === activeId) { reset(); setMessages([]); }
-      refreshConversations();
+      await apiJson(`/api/conversations/${id}`, { method: "DELETE" });
+      selectionRef.current++;
+      if (id === useChatStore.getState().activeId) { reset(); setComposerValue(""); editingFromIndexRef.current = null; }
+      await refreshConversations();
       toast.success("Conversation deleted");
-    } catch (e: any) {
-      toast.error("Delete failed: " + e.message);
-    }
-  }, [activeId, refreshConversations, reset, setMessages]);
+    } catch (error) { toast.error("Delete failed: " + (error as Error).message); }
+  }, [refreshConversations, reset]);
 
-  const togglePin = useCallback(async (id: string, pinned: boolean) => {
-    await fetch(`/api/conversations/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ pinned }) });
-    refreshConversations();
-  }, [refreshConversations]);
-
-  const toggleFavorite = useCallback(async (id: string, favorited: boolean) => {
-    await fetch(`/api/conversations/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ favorited }) });
-    refreshConversations();
-    toast.success(favorited ? "★ Favorited" : "Unfavorited");
-  }, [refreshConversations]);
-
-  const toggleArchive = useCallback(async (id: string, archived: boolean) => {
-    await fetch(`/api/conversations/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ archived }) });
-    // If we archived the active conversation, clear the chat view.
-    if (archived && id === activeId) {
-      reset();
-      setMessages([]);
-    }
-    refreshConversations();
-    toast.success(archived ? "Conversation archived" : "Conversation restored");
-  }, [refreshConversations, activeId, reset, setMessages]);
-
-  const rename = useCallback(async (id: string, title: string) => {
-    await fetch(`/api/conversations/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ title }) });
-    refreshConversations();
-  }, [refreshConversations]);
+  const updateConversation = useCallback(async (id: string, patch: Record<string, unknown>, message?: string) => {
+    if (useChatStore.getState().streaming && patch.archived) { toast.info("Stop the current run before archiving it."); return; }
+    try {
+      await apiJson(`/api/conversations/${id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(patch) });
+      if (patch.archived && id === useChatStore.getState().activeId) {
+        selectionRef.current++;
+        reset(); setComposerValue(""); editingFromIndexRef.current = null;
+      }
+      await refreshConversations();
+      if (message) toast.success(message);
+    } catch (error) { toast.error("Update failed: " + (error as Error).message); }
+  }, [refreshConversations, reset]);
+  const togglePin = (id: string, pinned: boolean) => updateConversation(id, { pinned });
+  const toggleFavorite = (id: string, favorited: boolean) => updateConversation(id, { favorited }, favorited ? "Favorited" : "Unfavorited");
+  const toggleArchive = (id: string, archived: boolean) => updateConversation(id, { archived }, archived ? "Conversation archived" : "Conversation restored");
+  const rename = (id: string, title: string) => updateConversation(id, { title });
 
   const exportReport = useCallback(async (format: "markdown" | "json" = "markdown") => {
     if (!activeId) { toast.error("No active conversation to export."); return; }
@@ -238,8 +277,12 @@ function AppShell() {
   }, [activeId]);
 
   // ---------- the streaming send loop ----------
-  const send = useCallback(async (text: string) => {
-    if (streaming) return;
+  const send = useCallback(async (text: string): Promise<boolean> => {
+    if (useChatStore.getState().streaming || !text.trim()) return false;
+    // Lock before the first await: double Enter cannot create two conversations.
+    setStreaming(true);
+    selectionRef.current++;
+    let accepted = false;
     let convId = activeId;
     if (!convId) {
       try {
@@ -256,25 +299,28 @@ function AppShell() {
         setActive(convId);
       } catch (e: any) {
         toast.error("Failed to create conversation: " + e.message);
-        return;
+        setStreaming(false);
+        return false;
       }
     }
 
-    // If editing an existing message, truncate messages from that index onward.
     if (editingFromIndexRef.current !== null && convId) {
       const editIdx = editingFromIndexRef.current;
-      editingFromIndexRef.current = null;
-      const kept = useChatStore.getState().messages.slice(0, editIdx);
-      setMessages(kept);
-      // Delete the trailing messages from the DB.
+      const current = useChatStore.getState().messages;
+      const fromMessageId = current[editIdx]?.id;
       try {
-        const conv = await fetch(`/api/conversations/${convId}`).then((r) => r.json());
-        const allMsgs = conv.messages || [];
-        const toDelete = allMsgs.slice(editIdx);
-        for (const m of toDelete) {
-          await fetch(`/api/conversations/${convId}/messages/${m.id}`, { method: "DELETE" });
-        }
-      } catch {}
+        if (!fromMessageId) throw new Error("Reload this conversation before editing its messages.");
+        await apiJson(`/api/conversations/${convId}/messages`, {
+          method: "DELETE", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ fromMessageId }),
+        });
+        editingFromIndexRef.current = null;
+        setMessages(current.slice(0, editIdx));
+      } catch (error) {
+        toast.error("Could not edit message: " + (error as Error).message);
+        setStreaming(false);
+        return false;
+      }
     }
 
     // optimistic user message
@@ -315,7 +361,11 @@ function AppShell() {
         body: JSON.stringify({ conversationId: convId, message: text }),
         signal: ac.signal,
       });
-      if (!resp.ok || !resp.body) throw new Error(`chat request failed: ${resp.status}`);
+      if (!resp.ok || !resp.body) {
+        const error = await resp.json().catch(() => null);
+        throw new Error(error?.error || `Chat request failed (${resp.status}).`);
+      }
+      accepted = true;
 
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
@@ -420,7 +470,7 @@ function AppShell() {
               break;
             }
             case "progress": {
-              setProgress({ iteration: ev.iteration + 1, maxIterations: ev.maxIterations });
+              setProgress({ iteration: ev.iteration + 1, maxIterations: ev.maxIterations, actionCount: ev.actionCount });
               break;
             }
           }
@@ -440,47 +490,22 @@ function AppShell() {
       }
       sealThought();
     } finally {
+      // Reload canonical messages, including database IDs needed for edit/retry.
+      try {
+        const saved = await apiJson<{ messages: ChatMessage[] }>(`/api/conversations/${convId}`);
+        if (useChatStore.getState().activeId === convId) setMessages(saved.messages);
+      } catch { /* Keep the visible transcript when persistence is unavailable. */ }
       setStreaming(false);
       setThinking(false);
+      setProgress(null);
       abortRef.current = null;
     }
-  }, [streaming, activeId, appendMessage, setActive, setMessages, setThinking, refreshConversations, thinking]);
-
-  const lastDupeCountRef = useRef(0);
-
-  const refreshRecon = useCallback(async (convId: string) => {
-    try {
-      const r = await fetch(`/api/conversations/${convId}`);
-      if (!r.ok) return;
-      const data = await r.json();
-      // Merge: replace with server truth.
-      setFindings(data.findings || []);
-      setExploits(data.exploits || []);
-
-      // Check for cross-audit duplicates — toast if a new duplicate appeared.
-      try {
-        const dr = await fetch("/api/findings/duplicates");
-        const dj = await dr.json();
-        const newCount = (dj.groups || []).filter((g: any) =>
-          g.occurrences.some((o: any) => o.conversationId === convId)
-        ).length;
-        if (newCount > lastDupeCountRef.current && lastDupeCountRef.current !== -1 && newCount > 0) {
-          const delta = newCount - lastDupeCountRef.current;
-          toast.warning(`⚠ ${delta} finding${delta > 1 ? "s" : ""} match${delta > 1 ? "" : "es"} an existing cross-audit duplicate`, {
-            description: "Likely un-rotated credential — check the Dupes tab.",
-          });
-        }
-        lastDupeCountRef.current = newCount;
-      } catch {}
-    } catch {}
-  }, [setFindings, setExploits]);
+    return accepted;
+  }, [activeId, appendMessage, setActive, setMessages, setThinking, setStreaming, setProgress, refreshConversations, refreshRecon, thinking]);
 
   const stop = useCallback(() => {
     abortRef.current?.abort();
-    setStreaming(false);
-    setThinking(false);
-    setProgress(null);
-  }, [setStreaming, setThinking, setProgress]);
+  }, []);
 
   // Regenerate the last assistant response: drop trailing assistant messages
   // back to the last user message, then re-run the loop with that user prompt.
@@ -493,25 +518,13 @@ function AppShell() {
     }
     if (lastUserIdx < 0) return;
     const userText = messages[lastUserIdx].content;
-    // Truncate the display + DB to just before that user message.
-    const kept = messages.slice(0, lastUserIdx);
-    setMessages(kept);
-    // Delete the trailing messages from the DB (lastUserIdx onward).
-    try {
-      const conv = await fetch(`/api/conversations/${activeId}`).then((r) => r.json());
-      const allMsgs = conv.messages || [];
-      const toDelete = allMsgs.slice(lastUserIdx);
-      for (const m of toDelete) {
-        await fetch(`/api/conversations/${activeId}/messages/${m.id}`, { method: "DELETE" });
-      }
-    } catch {}
+    editingFromIndexRef.current = lastUserIdx;
     // Re-send the user prompt (it will be re-persisted by the chat route).
     await send(userText);
   }, [streaming, activeId, messages, setMessages, send]);
 
   // Edit a user message: populate the composer + set a truncation index.
   // When the user re-sends, messages from that index onward are deleted first.
-  const editingFromIndexRef = useRef<number | null>(null);
   const editMessage = useCallback((index: number, content: string) => {
     if (streaming) return;
     editingFromIndexRef.current = index;
@@ -526,20 +539,18 @@ function AppShell() {
 
   // Clear all messages in the active conversation (keeps the conversation shell).
   const clearConversation = useCallback(async () => {
-    if (!activeId) return;
+    if (!activeId || useChatStore.getState().streaming) return;
+    if (!window.confirm("Clear all messages? Saved findings and reports will be kept.")) return;
+    setStreaming(true);
     try {
-      const conv = await fetch(`/api/conversations/${activeId}`).then((r) => r.json());
-      for (const m of conv.messages || []) {
-        await fetch(`/api/conversations/${activeId}/messages/${m.id}`, { method: "DELETE" });
-      }
+      await apiJson(`/api/conversations/${activeId}/messages`, { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ all: true }) });
       setMessages([]);
-      setFindings([]);
-      setExploits([]);
-      toast.success("Conversation cleared");
-    } catch (e: any) {
-      toast.error("Clear failed: " + e.message);
-    }
-  }, [activeId, setMessages, setFindings, setExploits]);
+      editingFromIndexRef.current = null;
+      setComposerValue("");
+      toast.success("Messages cleared; saved findings kept");
+    } catch (error) { toast.error("Clear failed: " + (error as Error).message); }
+    finally { setStreaming(false); }
+  }, [activeId, setMessages, setStreaming]);
 
   const pickLandingChip = (prompt: string) => {
     setComposerValue(prompt);
@@ -551,28 +562,25 @@ function AppShell() {
   };
 
   const onSaveSettings = useCallback(async (patch: Partial<AppSettings>) => {
-    const r = await fetch("/api/settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(patch) });
-    const s = await r.json();
-    setSettings({ ...DEFAULT_SETTINGS, ...s });
-    patchSettings(patch);
-    toast.success("Settings saved");
-  }, [setSettings, patchSettings]);
+    const s = await apiJson<AppSettings>("/api/settings", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(patch) });
+    setSettings({ ...DEFAULT_SETTINGS, ...s, runtime: { ...DEFAULT_SETTINGS.runtime, ...s.runtime } });
+  }, [setSettings]);
 
   // ---------- theme toggle ----------
   const toggleTheme = () => {
     if (!settings) return;
     const next = settings.theme === "dark" ? "light" : "dark";
-    onSaveSettings({ theme: next });
+    onSaveSettings({ theme: next }).catch((error: Error) => toast.error("Theme could not be saved", { description: error.message }));
   };
 
   const hasActiveChat = messages.length > 0;
   const showLanding = !hasActiveChat && !streaming;
 
   return (
-    <div className="vx-scanlines vx-glass-ambient h-screen flex flex-col bg-[var(--vx-bg)] text-[var(--vx-text)]">
+    <div className="vx-scanlines vx-glass-ambient h-dvh flex flex-col overflow-hidden bg-[var(--vx-bg)] text-[var(--vx-text)]">
       {/* ===== topbar ===== */}
       <header className="flex-shrink-0 h-12 flex items-center gap-2 px-3 vx-glass z-30 rounded-none">
-        <button onClick={() => setSidebarOpen(!sidebarOpen)} className="p-1.5 rounded hover:bg-[var(--vx-panel-2)] text-[var(--vx-text-muted)]" aria-label="Toggle sidebar">
+        <button onClick={() => { setSidebarTab("chats"); setSidebarOpen(sidebarTab !== "chats" || !sidebarOpen); }} className="p-1.5 rounded hover:bg-[var(--vx-panel-2)] text-[var(--vx-text-muted)]" aria-label="Toggle sidebar">
           <Menu className="w-4 h-4" />
         </button>
         <div className="flex items-center gap-1.5">
@@ -584,7 +592,7 @@ function AppShell() {
         </div>
         <div className="flex items-center gap-1.5 ml-3 text-[11px] text-[var(--vx-text-muted)] vx-mono">
           <span className={`w-1.5 h-1.5 rounded-full ${streaming ? "bg-[var(--vx-accent)] vx-pulse" : "bg-[var(--vx-ok)]"}`} />
-          {streaming ? "auditing…" : "ready"}
+          {streaming ? "working…" : bootError ? "offline" : "ready"}
           {streaming && progress && (
             <span className="flex items-center gap-1.5 ml-1">
               <span className="text-[var(--vx-accent)]">·</span>
@@ -610,6 +618,10 @@ function AppShell() {
         </button>
       </header>
 
+      {bootError && <div role="alert" className="flex items-center gap-3 border-b border-[var(--vx-border)] bg-[var(--vx-panel)] px-4 py-3 text-xs">
+        <span className="flex-1 text-[var(--sev-high)]">Workspace unavailable: {bootError}</span>
+        <button onClick={() => void loadWorkspace()} className="shrink-0 rounded border border-[var(--vx-border)] px-3 py-1.5">Retry connection</button>
+      </div>}
       {/* ===== body ===== */}
       <div className="flex-1 flex overflow-hidden">
         <Sidebar
@@ -678,7 +690,7 @@ function AppShell() {
 
           {/* right panel (Recon / Tester / Agent / Settings / CLI / Stats) */}
           {showPanel && (
-            <aside className="fixed inset-0 z-40 lg:static lg:z-auto lg:flex w-full lg:w-[420px] xl:w-[480px] flex-shrink-0 vx-glass-strong flex-col vx-slide-in-right">
+            <aside className="fixed inset-0 z-40 lg:static lg:z-auto flex min-h-0 w-full lg:w-[420px] xl:w-[480px] flex-shrink-0 vx-glass-strong flex-col vx-slide-in-right">
               <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--vx-border)]">
                 <div className="flex items-center gap-1.5 text-sm font-semibold text-[var(--vx-accent)] capitalize">
                   <PanelRightClose className="w-4 h-4" /> {sidebarTab}
@@ -695,13 +707,13 @@ function AppShell() {
                     <ExploitCatalog exploits={exploits} conversationId={activeId} onChanged={() => activeId && refreshRecon(activeId)} />
                   </div>
                 )}
-                {sidebarTab === "history" && <ToolHistory conversationId={activeId} />}
+                {sidebarTab === "history" && <ToolHistory key={activeId} conversationId={activeId} />}
                 {sidebarTab === "search" && <FindingsSearch onPickConversation={pickConversation} />}
                 {sidebarTab === "timeline" && <SeverityTimeline />}
                 {sidebarTab === "duplicates" && <DuplicatesPanel onPickConversation={pickConversation} />}
                 {sidebarTab === "tester" && <ToolTester conversationId={activeId} scope={settings?.targetScope || ""} />}
                 {sidebarTab === "agent" && settings && <AgentControlsPanel settings={settings} onSave={onSaveSettings as any} />}
-                {sidebarTab === "settings" && settings && <SettingsPanel settings={settings} onSave={onSaveSettings} />}
+                {sidebarTab === "settings" && settings && <SettingsPanel key={JSON.stringify(settings)} settings={settings} onSave={onSaveSettings} />}
                 {sidebarTab === "cli" && <CliPanel />}
                 {sidebarTab === "stats" && <StatsDashboard convId={activeId} />}
               </div>
@@ -770,6 +782,7 @@ function AppShell() {
         onDeleteActive={() => activeId && deleteConversation(activeId)}
         onExport={exportReport}
         onPickConversation={pickConversation}
+        onToggleTheme={toggleTheme}
       />
 
       <ShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
@@ -805,8 +818,8 @@ function ReconSummary({ findings, exploits }: { findings: import("@/lib/types").
           const e = eBySev[i].count;
           const n = f + e;
           return (
-            <div key={s} className={`rounded-md border border-[color-mix(in_oklab,var(--sev-${s})_30%,transparent)] bg-[color-mix(in_oklab,var(--sev-${s})_8%,transparent)] p-1.5 text-center`}>
-              <div className={`text-lg font-bold vx-mono text-[var(--sev-${s})]`}>{n}</div>
+            <div key={s} className="rounded-md border p-1.5 text-center" style={{ borderColor: `color-mix(in oklab, var(--sev-${s}) 30%, transparent)`, background: `color-mix(in oklab, var(--sev-${s}) 8%, transparent)` }}>
+              <div className="text-lg font-bold vx-mono" style={{ color: `var(--sev-${s})` }}>{n}</div>
               <div className="text-[9px] uppercase tracking-wider text-[var(--vx-text-muted)] font-semibold">{s}</div>
             </div>
           );

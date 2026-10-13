@@ -4,7 +4,11 @@ import { useState } from "react";
 import { Save, RotateCw, ShieldAlert, Globe } from "lucide-react";
 import type { AppSettings } from "@/lib/types";
 import { DEFAULT_RUNTIME_PARAMS } from "@/lib/types";
-import { useToast } from "@/hooks/use-toast";
+import { toast as notify } from "sonner";
+
+function toast({ title, description, variant }: { title: string; description?: string; variant?: string }) {
+  (variant === "destructive" ? notify.error : notify.success)(title, { description });
+}
 
 interface Props {
   settings: AppSettings;
@@ -12,7 +16,6 @@ interface Props {
 }
 
 export function SettingsPanel({ settings, onSave }: Props) {
-  const { toast } = useToast();
   const [provider, setProvider] = useState(settings.provider);
   const [model, setModel] = useState(settings.model);
   const [scope, setScope] = useState(settings.targetScope);
@@ -127,7 +130,6 @@ interface AgentProps {
 }
 
 export function AgentControlsPanel({ settings, onSave }: AgentProps) {
-  const { toast } = useToast();
   const r = settings.runtime;
   const [maxIter, setMaxIter] = useState(r.maxIterations);
   const [minActions, setMinActions] = useState(r.minActions);

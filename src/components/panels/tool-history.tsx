@@ -18,7 +18,7 @@ export function ToolHistory({ conversationId }: { conversationId: string | null 
   const [open, setOpen] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    if (!conversationId) { setCalls([]); return; }
+    if (!conversationId) return;
     let cancelled = false;
     const load = async () => {
       setLoading(true);

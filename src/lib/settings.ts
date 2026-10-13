@@ -29,7 +29,7 @@ function num(v: string | undefined, d: number): number {
   return Number.isFinite(n) ? n : d;
 }
 
-export async function saveSettings(patch: Partial<AppSettings> & { runtime?: Partial<AgentRuntimeParams> }): Promise<AppSettings> {
+export async function saveSettings(patch: Omit<Partial<AppSettings>, "runtime"> & { runtime?: Partial<AgentRuntimeParams> }): Promise<AppSettings> {
   const ops: { key: string; value: string }[] = [];
   if (patch.provider !== undefined) ops.push({ key: "provider", value: patch.provider });
   if (patch.model !== undefined) ops.push({ key: "model", value: patch.model });

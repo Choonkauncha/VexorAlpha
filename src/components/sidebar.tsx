@@ -39,15 +39,15 @@ export function Sidebar(props: SidebarProps) {
   const findings = useChatStore((s) => s.findings);
   const exploits = useChatStore((s) => s.exploits);
 
-  if (!sidebarOpen) return null;
+  if (!sidebarOpen || sidebarTab !== "chats") return null;
 
   return (
-    <aside className="fixed inset-y-0 left-0 z-40 w-[300px] sm:w-[340px] vx-glass-strong flex flex-col vx-fade-in lg:static lg:z-auto">
+    <aside className="fixed inset-y-0 left-0 z-40 w-[min(300px,100vw)] sm:w-[340px] vx-glass-strong flex flex-col vx-fade-in lg:static lg:z-auto">
       <div className="flex items-center justify-between px-3 py-2.5 border-b border-[var(--vx-border)]">
         <div className="flex items-center gap-1.5 text-sm font-semibold text-[var(--vx-accent)] vx-mono">
           <Terminal className="w-4 h-4" /> vexor
         </div>
-        <button onClick={() => setSidebarOpen(false)} className="lg:hidden text-[var(--vx-text-muted)] hover:text-[var(--vx-text)]">
+        <button aria-label="Close sidebar" onClick={() => setSidebarOpen(false)} className="lg:hidden text-[var(--vx-text-muted)] hover:text-[var(--vx-text)]">
           <X className="w-4 h-4" />
         </button>
       </div>
@@ -72,16 +72,6 @@ export function Sidebar(props: SidebarProps) {
         {sidebarTab === "chats" && (
           <ChatsTab conversations={conversations} activeId={activeId} onNewChat={props.onNewChat} onOpenTemplates={props.onOpenTemplates} onPick={props.onPick} onDelete={props.onDelete} onTogglePin={props.onTogglePin} onToggleFavorite={props.onToggleFavorite} onToggleArchive={props.onToggleArchive} onRename={props.onRename} onExport={props.onExport} onTagsChange={props.onTagsChange} />
         )}
-        {sidebarTab === "recon" && <ReconTab findings={findings} exploits={exploits} />}
-        {sidebarTab === "search" && <SearchTabStub />}
-        {sidebarTab === "timeline" && <TimelineTabStub />}
-        {sidebarTab === "duplicates" && <DuplicatesTabStub />}
-        {sidebarTab === "history" && <HistoryTabStub />}
-        {sidebarTab === "tester" && <TesterTabStub />}
-        {sidebarTab === "agent" && <AgentTabStub />}
-        {sidebarTab === "stats" && <StatsTabStub />}
-        {sidebarTab === "settings" && <SettingsTabStub />}
-        {sidebarTab === "cli" && <CliTabStub />}
       </div>
     </aside>
   );
@@ -136,21 +126,23 @@ function ChatsTab({
 
   // Debounced full-text search across messages + titles.
   useEffect(() => {
+    const controller = new AbortController();
     const q = query.trim();
-    if (!q) { setSearchResults(null); setSearching(false); return; }
-    setSearching(true);
     const t = setTimeout(async () => {
+      if (!q) { setSearchResults(null); setSearching(false); return; }
+      setSearching(true);
       try {
-        const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+        const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`, { signal: controller.signal });
+        if (!r.ok) throw new Error("Search failed");
         const j = await r.json();
-        setSearchResults(j.results || []);
+        if (!controller.signal.aborted) setSearchResults(j.results || []);
       } catch {
-        setSearchResults([]);
+        if (!controller.signal.aborted) setSearchResults([]);
       } finally {
-        setSearching(false);
+        if (!controller.signal.aborted) setSearching(false);
       }
-    }, 250);
-    return () => clearTimeout(t);
+    }, q ? 250 : 0);
+    return () => { clearTimeout(t); controller.abort(); };
   }, [query]);
 
   const addTag = async (convId: string, name: string, color = tagColor) => {

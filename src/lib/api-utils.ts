@@ -14,11 +14,16 @@ export function withJsonErrors<Args extends unknown[]>(
       return await handler(...args);
     } catch (err: any) {
       console.error("[api] unhandled route error:", err);
-      const message =
-        err?.code === "P1001" || /can't reach database|connect ECONNREFUSED/i.test(err?.message || "")
-          ? "Database is unreachable. Check that DATABASE_URL is set and the database is running."
-          : err?.message || "Internal server error";
-      return NextResponse.json({ error: message }, { status: 500 });
+      if (err instanceof SyntaxError) {
+        return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+      }
+      if (err?.code === "P2025") {
+        return NextResponse.json({ error: "Record not found." }, { status: 404 });
+      }
+      const databaseError = /^P\d{4}$/.test(err?.code || "") || /DATABASE_URL|PrismaClientInitializationError|can't reach database|connect ECONNREFUSED/i.test(err?.message || "");
+      return NextResponse.json({ error: databaseError
+        ? "Database unavailable. Check the database connection and schema configuration."
+        : "The request could not be completed. Please try again." }, { status: databaseError ? 503 : 500 });
     }
   };
 }

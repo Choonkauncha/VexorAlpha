@@ -2,7 +2,11 @@
 
 import { useEffect, useState } from "react";
 import { Play, RotateCw, ChevronDown, ChevronRight, Wrench, AlertCircle, CheckCircle2, Clock, Bookmark, BookmarkPlus, Trash2, Zap, Check } from "lucide-react";
-import { useToast } from "@/hooks/use-toast";
+import { toast as notify } from "sonner";
+
+function toast({ title, description, variant }: { title: string; description?: string; variant?: string }) {
+  (variant === "destructive" ? notify.error : notify.success)(title, { description });
+}
 
 interface ToolDef {
   name: string;
@@ -61,7 +65,6 @@ function savePresets(presets: Preset[]) {
 }
 
 export function ToolTester({ conversationId, scope }: { conversationId: string | null; scope: string }) {
-  const { toast } = useToast();
   const [tools, setTools] = useState<ToolDef[]>([]);
   const [selected, setSelected] = useState<string>("");
   const [args, setArgs] = useState<Record<string, string>>({});
@@ -88,7 +91,11 @@ export function ToolTester({ conversationId, scope }: { conversationId: string |
   }, [selected]);
 
   // Load presets from localStorage on mount.
-  useEffect(() => { setPresets(loadPresets()); }, []);
+  useEffect(() => {
+    // Read browser storage after hydration.
+    const id = requestAnimationFrame(() => setPresets(loadPresets()));
+    return () => cancelAnimationFrame(id);
+  }, []);
 
   const current = tools.find((t) => t.name === selected);
   const visibleTools = showAll ? tools : tools.filter((t) => SAFE_TOOLS.includes(t.name) || NETWORK_TOOLS.includes(t.name));

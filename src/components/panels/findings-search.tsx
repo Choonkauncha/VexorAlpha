@@ -25,21 +25,23 @@ export function FindingsSearch({ onPickConversation }: { onPickConversation?: (i
 
   // Debounced search across all conversations' findings.
   useEffect(() => {
+    const controller = new AbortController();
     const q = query.trim();
-    if (!q) { setResults(null); setSearching(false); return; }
-    setSearching(true);
     const t = setTimeout(async () => {
+      if (!q) { setResults(null); setSearching(false); return; }
+      setSearching(true);
       try {
-        const r = await fetch(`/api/findings/search?q=${encodeURIComponent(q)}`);
+        const r = await fetch(`/api/findings/search?q=${encodeURIComponent(q)}`, { signal: controller.signal });
+        if (!r.ok) throw new Error("Search failed");
         const j = await r.json();
-        setResults(j.results || []);
+        if (!controller.signal.aborted) setResults(j.results || []);
       } catch {
-        setResults([]);
+        if (!controller.signal.aborted) setResults([]);
       } finally {
-        setSearching(false);
+        if (!controller.signal.aborted) setSearching(false);
       }
-    }, 300);
-    return () => clearTimeout(t);
+    }, q ? 300 : 0);
+    return () => { clearTimeout(t); controller.abort(); };
   }, [query]);
 
   const toggleReveal = (key: string) =>

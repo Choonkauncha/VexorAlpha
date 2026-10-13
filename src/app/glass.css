@@ -1,3 +1,4 @@
+@layer components {
 /* Vexor Liquid Glass — loaded outside Tailwind processing */
 
 .vx-glass {
@@ -176,4 +177,14 @@
     radial-gradient(ellipse 800px 1000px at 90% 110%, rgba(80,160,220,0.12), transparent 50%),
     radial-gradient(ellipse 600px 600px at 50% 50%, rgba(120,220,200,0.06), transparent 60%),
     radial-gradient(ellipse 1200px 400px at 50% 0%, rgba(100,200,180,0.08), transparent 60%);
+}
+
+/* Surface styles must not override Tailwind positioning utilities. */
+.vx-glass, .vx-glass-strong, .vx-glass-card, .vx-glass-btn {
+  border: 1px solid var(--vx-border);
+  box-shadow: 0 8px 28px rgb(0 0 0 / 0.12);
+}
+.vx-glass::before, .vx-glass-strong::before, .vx-glass-card::before { opacity: 0.25; }
+.vx-glass-strong { background: var(--vx-bg); }
+.vx-glass-btn:hover { box-shadow: 0 3px 12px rgb(0 0 0 / 0.15); }
 }
