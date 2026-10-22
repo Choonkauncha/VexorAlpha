@@ -3,7 +3,7 @@
 // exploits, and yields a stream of AgentEvents (SSE-friendly).
 
 import { db } from "./db";
-import { createProviderStream, ProviderError, providerOrder, type ProviderId } from "./llm";
+import { createProviderStream, ProviderError, providerModels, providerOrder, type ProviderId } from "./llm";
 import { SYSTEM_PROMPT } from "./system-prompt";
 import { runTool, scanToolOutput } from "./security-tools";
 import { makeExploitEntry, mergeExploit } from "./exploits";
@@ -207,6 +207,7 @@ export async function* runAgentLoop(deps: LoopDeps): AsyncGenerator<AgentEvent> 
     return;
   }
   let activeProvider: ProviderId = providers[0];
+  const activeModels = new Map<ProviderId, string>();
 
   // Build a dynamic system prompt that includes the current authorization
   // scope, so the agent KNOWS what it's allowed to test without asking.
@@ -254,22 +255,33 @@ No authorized target scope is set. Network tools (dns_lookup, tls_inspect, finge
     try {
       let completed = false;
       const orderedProviders = [activeProvider, ...providers.filter((candidate) => candidate !== activeProvider)];
-      for (const candidate of orderedProviders) {
+      // Flatten to (provider, model) attempts: every free model of a provider
+      // (see model-fallbacks.ts), then the next provider's models.
+      const attempts = orderedProviders.flatMap((candidate) => {
+        // A user-picked model string only applies to the provider it was
+        // picked for — never carry it over to a fallback provider.
+        const requested = candidate === provider ? model : "";
+        const list = providerModels(candidate, requested);
+        // Prefer the model that last answered on this provider.
+        const sticky = activeModels.get(candidate);
+        const ordered = sticky && list.includes(sticky) ? [sticky, ...list.filter((m) => m !== sticky)] : list;
+        return ordered.map((candidateModel) => ({ candidate, candidateModel }));
+      });
+      let lastError: ProviderError | undefined;
+      for (let i = 0; i < attempts.length; i++) {
+        const { candidate, candidateModel } = attempts[i];
+        let produced = false;
         try {
-          // A user-picked model string only applies to the provider it was
-          // picked for. If we're falling back to a different provider,
-          // don't carry that model name over — let it use its own
-          // default/env model instead, or we'll send e.g. an OpenAI model
-          // name to the Anthropic API and get a guaranteed failure.
-          const candidateModel = candidate === provider ? model : "";
-          console.log(`[agent] iter ${iter} — provider=${candidate}, model=${candidateModel || "(default)"}`);
+          console.log(`[agent] iter ${iter} — provider=${candidate}, model=${candidateModel}`);
           for await (const chunk of createProviderStream({ provider: candidate, model: candidateModel, messages, thinkingBudget, temperature, signal })) {
             if (signal?.aborted) break;
             if (chunk.reasoning) {
+              produced = true;
               reasoning += chunk.reasoning;
               yield { type: "reasoning", content: chunk.reasoning };
             }
             if (chunk.content) {
+              produced = true;
               if (firstChunk) {
                 console.log(`[agent] first text chunk in ${Date.now() - callStart}ms`);
                 firstChunk = false;
@@ -278,18 +290,26 @@ No authorized target scope is set. Network tools (dns_lookup, tls_inspect, finge
               yield { type: "text", content: chunk.content };
             }
           }
+          if (!produced && !signal?.aborted) throw new ProviderError(`${candidate}/${candidateModel} returned an empty response`, candidate);
           activeProvider = candidate;
+          activeModels.set(candidate, candidateModel);
+          console.log(`[agent] iter ${iter} — answered by provider=${candidate}, model=${candidateModel}`);
           completed = true;
           break;
         } catch (e: any) {
           const error = e instanceof ProviderError ? e : new ProviderError(e?.message || String(e), candidate);
-          if (!error.isRateLimit || signal?.aborted) throw error;
-          const next = orderedProviders[orderedProviders.indexOf(candidate) + 1];
+          lastError = error;
+          // Don't retry once output has streamed (it would duplicate text),
+          // on user cancel, or on non-transient errors such as bad auth.
+          if (produced || signal?.aborted || !error.isRetryable) throw error;
+          const next = attempts[i + 1];
           if (!next) throw error;
-          console.warn(`[agent] ${candidate} rate-limited; switching to ${next}`);
-          yield { type: "reasoning", content: `Provider ${candidate} is rate limited; switching to ${next}.` };
+          const label = `${next.candidate}/${next.candidateModel}`;
+          console.warn(`[agent] ${candidate}/${candidateModel} failed (${error.status ?? "error"}): ${error.message.slice(0, 200)} — trying ${label}`);
+          yield { type: "reasoning", content: `Model ${candidate}/${candidateModel} unavailable (${error.isRateLimit ? "rate limited" : error.status ?? "error"}); switching to ${label}.` };
         }
       }
+      if (!completed && lastError) throw lastError;
       if (!completed) throw new Error("All configured providers failed");
 
       console.log(`[agent] iter ${iter} done in ${Date.now() - callStart}ms — text=${fullText.length} chars, reasoning=${reasoning.length} chars`);

@@ -2,6 +2,9 @@ import ZAI from "z-ai-web-dev-sdk";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_MODELS } from "./model-fallbacks";
+
+export { providerModels, FREE_MODELS } from "./model-fallbacks";
 
 export type ProviderId = "zai" | "openai" | "google" | "anthropic" | "openrouter";
 
@@ -25,15 +28,14 @@ export class ProviderError extends Error {
   get isRateLimit(): boolean {
     return this.status === 429 || /(?:status\s*)?429|rate.?limit|too many requests/i.test(this.message);
   }
-}
 
-const DEFAULT_MODELS: Record<ProviderId, string> = {
-  zai: "glm-4.6",
-  openai: "gpt-4o-mini",
-  google: "gemini-3.8-flash",
-  anthropic: "claude-3-5-haiku-latest",
-  openrouter: "openai/gpt-4o-mini",
-};
+  /** Errors where trying another model (or provider) may succeed. */
+  get isRetryable(): boolean {
+    if (this.isRateLimit) return true;
+    if (this.status !== undefined && (this.status >= 500 || this.status === 404 || this.status === 408)) return true;
+    return /quota|resource.?exhausted|timed? ?out|timeout|overloaded|unavailable|not.?found|no such model|does not exist|not supported|empty response|fetch failed|ECONNRESET|ETIMEDOUT|socket hang up/i.test(this.message);
+  }
+}
 
 const PROVIDERS: ProviderId[] = ["zai", "openai", "google", "anthropic", "openrouter"];
 
@@ -70,6 +72,26 @@ export function providerOrder(preferred: string): ProviderId[] {
   return candidates.filter(hasCredentials);
 }
 
+// Abort a model request if the provider hasn't started responding in time, so
+// the agent can fall back to the next model instead of hanging.
+async function fetchWithTimeout(provider: ProviderId, url: string, init: RequestInit, signal?: AbortSignal): Promise<Response> {
+  const ms = Number(env("MODEL_TIMEOUT_MS") || 60000);
+  const timer = new AbortController();
+  const handle = setTimeout(() => timer.abort(), ms);
+  const onAbort = () => timer.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await fetch(url, { ...init, signal: timer.signal });
+  } catch (e: any) {
+    if (signal?.aborted) throw e;
+    if (timer.signal.aborted) throw new ProviderError(`${provider} request timed out after ${ms}ms`, provider, 408);
+    throw new ProviderError(`${provider} request failed: ${e?.message || e}`, provider);
+  } finally {
+    clearTimeout(handle);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 function parseSseBlock(block: string): any | null {
   const line = block.split("\n").find((value) => value.startsWith("data: "));
   if (!line) return null;
@@ -88,12 +110,11 @@ async function* openAiCompatibleStream(
   signal?: AbortSignal,
   extraHeaders: Record<string, string> = {},
 ): AsyncGenerator<ProviderChunk> {
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(provider, url, {
     method: "POST",
-    signal,
     headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json", ...extraHeaders },
     body: JSON.stringify({ model, messages, stream: true, ...(temperature !== null ? { temperature } : {}) }),
-  });
+  }, signal);
   if (!response.ok) throw new ProviderError(`${provider} request failed (${response.status}): ${await response.text()}`, provider, response.status);
   if (!response.body) throw new ProviderError(`${provider} returned an empty response`, provider);
 
@@ -128,16 +149,15 @@ async function* googleStream(
     role: message.role === "assistant" ? "model" : "user",
     parts: [{ text: message.content }],
   }));
-  const response = await fetch(`${base}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`, {
+  const response = await fetchWithTimeout("google", `${base}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`, {
     method: "POST",
-    signal,
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
       contents,
       ...(temperature !== null ? { generationConfig: { temperature } } : {}),
     }),
-  });
+  }, signal);
   if (!response.ok) throw new ProviderError(`google request failed (${response.status}): ${await response.text()}`, "google", response.status);
   if (!response.body) throw new ProviderError("google returned an empty response", "google");
 
@@ -212,7 +232,9 @@ export async function* createProviderStream(options: {
   signal?: AbortSignal;
 }): AsyncGenerator<ProviderChunk> {
   const { provider, messages, thinkingBudget, temperature, signal } = options;
-  const model = providerModel(provider, options.model);
+  // The caller (agent loop) passes one concrete model from providerModels();
+  // fall back to the provider default only if none was given.
+  const model = options.model || providerModel(provider, "");
 
   if (provider === "zai") {
     const zai = await ZAI.create();
