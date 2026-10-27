@@ -10,11 +10,14 @@ import { NextRequest, NextResponse } from "next/server";
 import { runTool, scanToolOutput } from "@/lib/security-tools";
 import { loadSettings } from "@/lib/settings";
 import { db } from "@/lib/db";
+import { isSessionUser, ownedConversation, requireUser } from "@/lib/auth";
 import { makeExploitEntry } from "@/lib/exploits";
 
 export const runtime = "nodejs";
 
 export async function POST(req: NextRequest) {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
   let body: { name?: string; arguments?: Record<string, unknown>; conversationId?: string };
   try {
     body = await req.json();
@@ -25,7 +28,7 @@ export async function POST(req: NextRequest) {
   const args = body.arguments || {};
   if (!name) return NextResponse.json({ error: "name required" }, { status: 400 });
 
-  const settings = await loadSettings();
+  const settings = await loadSettings(user.id);
   const started = Date.now();
 
   try {
@@ -43,7 +46,7 @@ export async function POST(req: NextRequest) {
 
     // Persist to a conversation if one was provided.
     if (body.conversationId) {
-      const conv = await db.conversation.findUnique({ where: { id: body.conversationId } });
+      const conv = await ownedConversation(user.id, body.conversationId);
       if (conv) {
         // Persist the tool call.
         await db.toolCall.create({

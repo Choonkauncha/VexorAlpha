@@ -1,20 +1,18 @@
-// GET /api/findings/duplicates — find findings that appear across multiple
-// conversations (the same leaked secret / token / key detected in different
-// audits). Returns groups keyed by value, with the conversations each appears in.
-//
-// This is the "cross-audit secret detection" feature — surfaces secrets that
-// keep reappearing, which often indicates an un-rotated credential or a
-// systemic exposure.
+// GET /api/findings/duplicates — cross-audit duplicates within the caller's workspace.
 
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { isSessionUser, requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function GET() {
-  // Fetch all findings with their conversation titles.
+export async function GET(req: NextRequest) {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
+
   const findings = await db.finding.findMany({
+    where: { conversation: { userId: user.id } },
     select: {
       id: true,
       fingerprint: true,
@@ -31,9 +29,6 @@ export async function GET() {
     orderBy: { createdAt: "desc" },
   });
 
-  // Group by value (the actual secret). Masked values may collide for different
-  // real values, so we group by the real value — only the group with >1
-  // distinct conversation is a true cross-audit duplicate.
   const byValue = new Map<string, typeof findings>();
   for (const f of findings) {
     const arr = byValue.get(f.value) || [];
@@ -41,7 +36,6 @@ export async function GET() {
     byValue.set(f.value, arr);
   }
 
-  // Build duplicate groups: value appears in 2+ distinct conversations.
   const groups: {
     value: string; masked: string; type: string; category: string; severity: string;
     occurrenceCount: number; conversationCount: number;
@@ -51,7 +45,6 @@ export async function GET() {
   for (const [value, items] of byValue) {
     const convIds = new Set(items.map((f) => f.conversation.id));
     if (convIds.size < 2) continue;
-    // Pick the highest severity across all occurrences.
     const sevRank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
     const topSev = items.reduce((min, f) => (sevRank[f.severity] < sevRank[min] ? f.severity : min), "info");
     groups.push({
@@ -74,7 +67,6 @@ export async function GET() {
     });
   }
 
-  // Sort by conversation count desc, then severity.
   const sevRank: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
   groups.sort((a, b) => (b.conversationCount - a.conversationCount) || (sevRank[a.severity] - sevRank[b.severity]));
 

@@ -6,14 +6,17 @@ import { withJsonErrors } from "@/lib/api-utils";
 
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { isSessionUser, ownedConversation, requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export const GET = withJsonErrors(async (_req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+export const GET = withJsonErrors(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
   const { id } = await ctx.params;
-  const conv = await db.conversation.findUnique({
-    where: { id },
+  const conv = await db.conversation.findFirst({
+    where: { id, userId: user.id },
     include: {
       messages: { orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
       findings: { orderBy: [{ severity: "asc" }, { createdAt: "asc" }] },
@@ -78,7 +81,11 @@ export const GET = withJsonErrors(async (_req: NextRequest, ctx: { params: Promi
 });
 
 export const PATCH = withJsonErrors(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
   const { id } = await ctx.params;
+  const owned = await ownedConversation(user.id, id);
+  if (!owned) return NextResponse.json({ error: "not found" }, { status: 404 });
   const body = await req.json().catch(() => ({}));
   const data: { title?: string; pinned?: boolean; favorited?: boolean; archived?: boolean } = {};
   if (typeof body.title === "string") data.title = body.title.slice(0, 120);
@@ -89,8 +96,12 @@ export const PATCH = withJsonErrors(async (req: NextRequest, ctx: { params: Prom
   return NextResponse.json({ id: conv.id, title: conv.title, pinned: conv.pinned, favorited: conv.favorited, archived: conv.archived, updatedAt: conv.updatedAt });
 });
 
-export const DELETE = withJsonErrors(async (_req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+export const DELETE = withJsonErrors(async (req: NextRequest, ctx: { params: Promise<{ id: string }> }) => {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
   const { id } = await ctx.params;
+  const owned = await ownedConversation(user.id, id);
+  if (!owned) return NextResponse.json({ error: "not found" }, { status: 404 });
   await db.conversation.delete({ where: { id } });
   return NextResponse.json({ ok: true });
 });

@@ -105,12 +105,18 @@ export const DEFAULT_RUNTIME_PARAMS: AgentRuntimeParams = {
   reflectEvery: 6,
 };
 
+export type ProviderKeys = Partial<Record<"openai" | "google" | "anthropic" | "openrouter" | "zai", string>>;
+
 export interface AppSettings {
   provider: string;
   model: string;
   theme: "dark" | "light";
   targetScope: string; // authorized-target declaration the user acknowledges
   runtime: AgentRuntimeParams;
+  /** Masked BYOK keys for UI display only. */
+  providerKeys?: ProviderKeys;
+  /** Which BYOK slots have a stored secret (true) without revealing it. */
+  providerKeysPresent?: Partial<Record<keyof ProviderKeys, boolean>>;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -119,4 +125,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   theme: "light",
   targetScope: "",
   runtime: { ...DEFAULT_RUNTIME_PARAMS },
+  providerKeys: {},
+  providerKeysPresent: {},
 };

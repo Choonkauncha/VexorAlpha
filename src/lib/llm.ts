@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MODELS } from "./model-fallbacks";
+import { getRequestProviderKeys } from "./request-context";
 
 export { providerModels, FREE_MODELS } from "./model-fallbacks";
 
@@ -44,9 +45,16 @@ function env(name: string): string | undefined {
   return value || undefined;
 }
 
+function byok(provider: ProviderId): string | undefined {
+  const keys = getRequestProviderKeys();
+  const v = keys[provider];
+  return v && v.trim() ? v.trim() : undefined;
+}
+
 function hasCredentials(provider: ProviderId): boolean {
+  if (byok(provider)) return true;
   if (provider === "zai") {
-    return [join(process.cwd(), ".z-ai-config"), join(homedir(), ".z-ai-config"), "/etc/.z-ai-config"].some(existsSync);
+    return [join(process.cwd(), ".z-ai-config"), join(homedir(), ".z-ai-config"), "/etc/.z-ai-config"].some(existsSync) || Boolean(env("ZAI_API_KEY"));
   }
   return Boolean(env({ openai: "OPENAI_API_KEY", google: "GOOGLE_API_KEY", anthropic: "ANTHROPIC_API_KEY", openrouter: "OPENROUTER_API_KEY" }[provider]));
 }
@@ -142,7 +150,7 @@ async function* googleStream(
   temperature: number | null,
   signal?: AbortSignal,
 ): AsyncGenerator<ProviderChunk> {
-  const key = env("GOOGLE_API_KEY")!;
+  const key = (byok("google") || env("GOOGLE_API_KEY"))!;
   const base = env("GOOGLE_BASE_URL") || "https://generativelanguage.googleapis.com/v1beta";
   const system = messages.find((message) => message.role === "system")?.content;
   const contents = messages.filter((message) => message.role !== "system").map((message) => ({
@@ -185,7 +193,7 @@ async function* anthropicStream(
   temperature: number | null,
   signal?: AbortSignal,
 ): AsyncGenerator<ProviderChunk> {
-  const key = env("ANTHROPIC_API_KEY")!;
+  const key = (byok("anthropic") || env("ANTHROPIC_API_KEY"))!;
   const base = env("ANTHROPIC_BASE_URL") || "https://api.anthropic.com/v1";
   const system = messages.find((message) => message.role === "system")?.content;
   const response = await fetch(`${base}/messages`, {
@@ -275,7 +283,7 @@ export async function* createProviderStream(options: {
     return;
   }
 
-  const key = env(provider === "openai" ? "OPENAI_API_KEY" : "OPENROUTER_API_KEY")!;
+  const key = (byok(provider === "openai" ? "openai" : "openrouter") || env(provider === "openai" ? "OPENAI_API_KEY" : "OPENROUTER_API_KEY"))!;
   const base = env(provider === "openai" ? "OPENAI_BASE_URL" : "OPENROUTER_BASE_URL") ||
     (provider === "openai" ? "https://api.openai.com/v1" : "https://openrouter.ai/api/v1");
   yield* openAiCompatibleStream(provider, `${base.replace(/\/$/, "")}/chat/completions`, key, model, messages, temperature, signal,

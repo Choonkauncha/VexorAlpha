@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { Save, RotateCw, ShieldAlert, Globe } from "lucide-react";
-import type { AppSettings } from "@/lib/types";
+import type { AppSettings, ProviderKeys } from "@/lib/types";
 import { DEFAULT_RUNTIME_PARAMS } from "@/lib/types";
 import { toast as notify } from "sonner";
 
@@ -20,13 +20,21 @@ export function SettingsPanel({ settings, onSave }: Props) {
   const [model, setModel] = useState(settings.model);
   const [scope, setScope] = useState(settings.targetScope);
   const [theme, setTheme] = useState(settings.theme);
+  const [providerKeys, setProviderKeys] = useState<ProviderKeys>({
+    openai: "",
+    google: "",
+    anthropic: "",
+    openrouter: "",
+    zai: "",
+    ...(settings.providerKeys || {}),
+  });
   const [saving, setSaving] = useState(false);
 
   const save = async () => {
     setSaving(true);
     try {
-      await onSave({ provider, model, targetScope: scope, theme });
-      toast({ title: "Settings saved", description: "Provider, model, scope, and theme updated." });
+      await onSave({ provider, model, targetScope: scope, theme, providerKeys });
+      toast({ title: "Settings saved", description: "Provider, model, scope, keys, and theme updated." });
     } catch (e: any) {
       toast({ title: "Save failed", description: e.message, variant: "destructive" });
     } finally {
@@ -98,6 +106,40 @@ export function SettingsPanel({ settings, onSave }: Props) {
             ⚠ Network tools (http_probe, discover_paths, tls_inspect, fingerprint_web_tech, test_cors, analyze_js_bundles, dns_lookup) will refuse to run against any host NOT listed here. Only add systems you own or are explicitly authorized to test.
           </p>
         )}
+      </section>
+
+
+      <section>
+        <h3 className="text-[11px] uppercase tracking-wider text-[var(--vx-text-muted)] mb-2">Bring-your-own API keys (tenant-isolated)</h3>
+        <p className="mb-2 text-[11px] text-[var(--vx-text-muted)]">
+          Keys are stored only in your workspace and never shared with other tenants. Leave blank to use the server default. Enter a new value to rotate; clear the field and save to remove.
+        </p>
+        <div className="flex flex-col gap-2">
+          {([
+            ["openai", "OpenAI"],
+            ["google", "Google AI"],
+            ["anthropic", "Anthropic"],
+            ["openrouter", "OpenRouter"],
+            ["zai", "Z.ai"],
+          ] as const).map(([id, label]) => (
+            <label key={id} className="flex flex-col gap-1">
+              <span className="text-[11px] text-[var(--vx-text-muted)] flex items-center gap-2">
+                {label}
+                {settings.providerKeysPresent?.[id] ? (
+                  <span className="text-[10px] text-[var(--vx-ok)] vx-mono">stored</span>
+                ) : null}
+              </span>
+              <input
+                type="password"
+                autoComplete="off"
+                value={providerKeys[id] || ""}
+                onChange={(e) => setProviderKeys((prev) => ({ ...prev, [id]: e.target.value }))}
+                placeholder={settings.providerKeysPresent?.[id] ? "•••• stored — paste to replace" : "Optional — paste API key"}
+                className="w-full rounded-lg border border-[var(--vx-border)] bg-[var(--vx-bg)] px-3 py-2 vx-mono text-xs outline-none focus:border-[color-mix(in_oklab,var(--vx-accent)_50%,transparent)]"
+              />
+            </label>
+          ))}
+        </div>
       </section>
 
       <section>

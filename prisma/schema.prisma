@@ -1,5 +1,6 @@
 // Vexor — Prisma schema
 // Autonomous security analysis agent — Vexor.
+// Multi-tenant: every Conversation and Setting is scoped to a User (workspace).
 // Conversations, messages, findings, exploits, tool calls, and settings
 // are persisted server-side (Postgres) so they survive across browsers/devices
 // and across serverless invocations (Vercel's filesystem is not persistent,
@@ -18,8 +19,26 @@ datasource db {
   directUrl = env("DATABASE_URL_UNPOOLED")
 }
 
+model User {
+  id           String   @id @default(cuid())
+  email        String?  @unique
+  passwordHash String?
+  displayName  String
+  kind         String   @default("email") // "email" | "sandbox"
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  conversations Conversation[]
+  settings      Setting[]
+
+  @@index([kind])
+  @@index([createdAt])
+}
+
 model Conversation {
   id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   title       String    @default("New conversation")
   pinned      Boolean   @default(false)
   favorited   Boolean   @default(false)
@@ -33,6 +52,8 @@ model Conversation {
   toolCalls   ToolCall[]
   tags        ConversationTag[]
 
+  @@index([userId, updatedAt])
+  @@index([userId, archived])
   @@index([updatedAt])
   @@index([pinned])
   @@index([favorited])
@@ -130,8 +151,13 @@ model ToolCall {
   @@index([name])
 }
 
-// Key-value settings store (provider, model, agent tunables, theme, etc.)
+// Per-user key-value settings (provider, model, agent tunables, theme, BYOK keys, etc.)
 model Setting {
-  key   String @id
-  value String
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  key    String
+  value  String
+
+  @@id([userId, key])
+  @@index([userId])
 }

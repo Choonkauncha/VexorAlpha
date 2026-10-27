@@ -1,16 +1,14 @@
-// POST /api/findings/false-positive — toggle the falsePositive flag on a finding.
-// Body: { conversationId, fingerprint, falsePositive }
-// Returns: { ok: true, falsePositive: boolean }
-//
-// Soft-delete: instead of removing a finding, mark it as a false positive so it
-// can be filtered out of the active view but retained for the audit trail.
+// POST /api/findings/false-positive — toggle falsePositive on an owned finding.
 
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { isSessionUser, ownedConversation, requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 
 export async function POST(req: NextRequest) {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
   let body: { conversationId?: string; fingerprint?: string; falsePositive?: boolean };
   try {
     body = await req.json();
@@ -22,6 +20,8 @@ export async function POST(req: NextRequest) {
   if (!conversationId || !fingerprint) {
     return NextResponse.json({ error: "conversationId + fingerprint required" }, { status: 400 });
   }
+  const owned = await ownedConversation(user.id, conversationId);
+  if (!owned) return NextResponse.json({ error: "not found" }, { status: 404 });
   const falsePositive = !!body.falsePositive;
   try {
     await db.finding.update({

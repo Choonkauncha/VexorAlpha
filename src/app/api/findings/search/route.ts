@@ -1,28 +1,28 @@
-// GET /api/findings/search?q=<query> — search findings across ALL conversations.
-// Returns matching findings with their conversation details, so the UI can
-// show which audit each finding belongs to.
+// GET /api/findings/search?q=<query> — search findings across the caller's conversations.
 
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { isSessionUser, requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
+
   const q = (req.nextUrl.searchParams.get("q") || "").trim();
   if (!q) return NextResponse.json({ results: [] });
 
   const lowerQ = q.toLowerCase();
 
-  // Fetch all findings with conversation details.
   const findings = await db.finding.findMany({
-    where: { falsePositive: false },
+    where: { falsePositive: false, conversation: { userId: user.id } },
     include: { conversation: { select: { id: true, title: true } } },
     orderBy: [{ severity: "asc" }, { createdAt: "desc" }],
     take: 1000,
   });
 
-  // Filter in JS (SQLite LIKE is case-sensitive for non-ASCII).
   const results = findings
     .filter((f) =>
       f.type.toLowerCase().includes(lowerQ) ||

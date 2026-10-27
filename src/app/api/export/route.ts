@@ -3,19 +3,23 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { isSessionUser, requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 
 const SEV_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
+
 export async function POST(req: NextRequest) {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
   const body = await req.json().catch(() => ({}));
   const conversationId = String(body.conversationId || "");
   const format = body.format === "json" ? "json" : "markdown";
   if (!conversationId) return NextResponse.json({ error: "conversationId required" }, { status: 400 });
 
-  const conv = await db.conversation.findUnique({
-    where: { id: conversationId },
+  const conv = await db.conversation.findFirst({
+    where: { id: conversationId, userId: user.id },
     include: {
       messages: { orderBy: { createdAt: "asc" } },
       findings: { orderBy: [{ severity: "asc" }, { createdAt: "asc" }] },

@@ -27,6 +27,9 @@ import { useChatStore, useSettingsStore, useUIStore } from "@/lib/store";
 import type { AgentEvent, AppSettings, ChatMessage } from "@/lib/types";
 import { apiJson } from "@/lib/client-api";
 import { DEFAULT_SETTINGS } from "@/lib/types";
+import { AuthModal } from "@/components/auth/auth-modal";
+import { WorkspaceBadge } from "@/components/auth/workspace-badge";
+import type { SessionUserPublic } from "@/components/auth/types";
 
 export default function Home() {
   return <AppShell />;
@@ -55,6 +58,10 @@ function AppShell() {
   const { sidebarOpen, setSidebarOpen, sidebarTab, setSidebarTab, paletteOpen, setPaletteOpen } = useUIStore();
 
   const [bootError, setBootError] = useState<string | null>(null);
+  const [authUser, setAuthUser] = useState<SessionUserPublic | null>(null);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [forceAuthModal, setForceAuthModal] = useState(false);
   const [composerValue, setComposerValue] = useState("");
   const [paletteKey, setPaletteKey] = useState(0);
   const showPanel = useUIStore((s) => s.panelOpen);
@@ -110,12 +117,26 @@ function AppShell() {
     }
   }, [setConversations]);
 
+  const clearLocalWorkspace = useCallback(() => {
+    setConversations([]);
+    setActive(null);
+    setMessages([]);
+    setFindings([]);
+    setExploits([]);
+    setSettings(DEFAULT_SETTINGS);
+    setBootError(null);
+  }, [setConversations, setActive, setMessages, setFindings, setExploits, setSettings]);
+
   const loadWorkspace = useCallback(async () => {
     const results = await Promise.all([
       apiJson<AppSettings>("/api/settings").then((s) => {
         setSettings({ ...DEFAULT_SETTINGS, ...s, runtime: { ...DEFAULT_SETTINGS.runtime, ...s.runtime } });
         return true;
       }).catch((error: Error) => {
+        if (/Authentication required/i.test(error.message)) {
+          setAuthUser(null);
+          setForceAuthModal(true);
+        }
         setBootError(error.message);
         return false;
       }),
@@ -124,9 +145,67 @@ function AppShell() {
     if (results.every(Boolean)) setBootError(null);
   }, [refreshConversations, setSettings]);
 
-  // Boot synchronizes with the server; all state updates occur after network responses.
+  const checkAuth = useCallback(async () => {
+    setAuthChecking(true);
+    try {
+      const res = await fetch("/api/auth/me");
+      if (!res.ok) {
+        setAuthUser(null);
+        clearLocalWorkspace();
+        return;
+      }
+      const data = await res.json();
+      setAuthUser(data.user);
+      setForceAuthModal(false);
+      await loadWorkspace();
+    } catch {
+      setAuthUser(null);
+    } finally {
+      setAuthChecking(false);
+    }
+  }, [clearLocalWorkspace, loadWorkspace]);
+
+  const handleAuthenticated = useCallback(async (user: SessionUserPublic) => {
+    setAuthUser(user);
+    setForceAuthModal(false);
+    clearLocalWorkspace();
+    await loadWorkspace();
+  }, [clearLocalWorkspace, loadWorkspace]);
+
+  const handleSignOut = useCallback(async () => {
+    setAuthBusy(true);
+    try {
+      await fetch("/api/auth/signout", { method: "POST" });
+    } finally {
+      setAuthUser(null);
+      clearLocalWorkspace();
+      setForceAuthModal(true);
+      setAuthBusy(false);
+    }
+  }, [clearLocalWorkspace]);
+
+  const handleSwitchAccount = useCallback(async () => {
+    await handleSignOut();
+  }, [handleSignOut]);
+
+  const handleNewSandbox = useCallback(async () => {
+    setAuthBusy(true);
+    try {
+      await fetch("/api/auth/signout", { method: "POST" });
+      const res = await fetch("/api/auth/sandbox", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Sandbox failed");
+      await handleAuthenticated(data.user);
+    } catch (e: any) {
+      setBootError(e.message || "Could not create sandbox");
+    } finally {
+      setAuthBusy(false);
+    }
+  }, [handleAuthenticated]);
+
+  // Boot: resolve session first, then load tenant-scoped workspace.
   // eslint-disable-next-line react-hooks/set-state-in-effect
-  useEffect(() => { void loadWorkspace(); }, [loadWorkspace]);
+  useEffect(() => { void checkAuth(); }, [checkAuth]);
   useEffect(() => () => { abortRef.current?.abort(); }, []);
 
   // ---------- actions ----------
@@ -578,6 +657,14 @@ function AppShell() {
 
   return (
     <div className="vx-scanlines vx-glass-ambient h-dvh flex flex-col overflow-hidden bg-[var(--vx-bg)] text-[var(--vx-text)]">
+      {(forceAuthModal || (!authChecking && !authUser)) && (
+        <AuthModal onAuthenticated={(u) => void handleAuthenticated(u)} />
+      )}
+      {authChecking && !authUser && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-[var(--vx-bg)] text-sm text-[var(--vx-text-muted)] vx-mono">
+          Checking workspace session…
+        </div>
+      )}
       {/* ===== topbar ===== */}
       <header className="flex-shrink-0 h-12 flex items-center gap-2 px-3 vx-glass z-30 rounded-none">
         <button onClick={() => { setSidebarTab("chats"); setSidebarOpen(sidebarTab !== "chats" || !sidebarOpen); }} className="p-1.5 rounded hover:bg-[var(--vx-panel-2)] text-[var(--vx-text-muted)]" aria-label="Toggle sidebar">
@@ -613,6 +700,15 @@ function AppShell() {
         <button onClick={openPalette} className="hidden sm:flex items-center gap-1.5 px-2 py-1 rounded border border-[var(--vx-border)] text-[11px] text-[var(--vx-text-muted)] hover:text-[var(--vx-accent)] hover:border-[color-mix(in_oklab,var(--vx-accent)_40%,transparent)] vx-mono">
           <CommandIcon className="w-3 h-3" /> ⌘K
         </button>
+        {authUser && (
+          <WorkspaceBadge
+            user={authUser}
+            busy={authBusy}
+            onSignOut={() => void handleSignOut()}
+            onSwitchAccount={() => void handleSwitchAccount()}
+            onNewSandbox={() => void handleNewSandbox()}
+          />
+        )}
         <button onClick={toggleTheme} className="p-1.5 rounded hover:bg-[var(--vx-panel-2)] text-[var(--vx-text-muted)]" aria-label="Toggle theme">
           {settings?.theme === "dark" ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
         </button>

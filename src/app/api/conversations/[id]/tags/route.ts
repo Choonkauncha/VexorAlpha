@@ -1,11 +1,11 @@
 // /api/conversations/[id]/tags
 // POST   { name, color? } — add a tag to a conversation
 // DELETE { name }         — remove a tag by name
-// GET    — list all distinct tag names + colors across all conversations
-//          (for the tag filter chips in the sidebar)
+// GET    — list tags (id=all → distinct tags across THIS user's conversations)
 
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { isSessionUser, ownedConversation, requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,17 +13,19 @@ export const dynamic = "force-dynamic";
 const VALID_COLORS = ["accent", "cyan", "warn", "danger", "ok"];
 
 export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
   const { id } = await ctx.params;
-  // If id is "all", return all distinct tags across conversations.
   if (id === "all") {
     const tags = await db.conversationTag.findMany({
+      where: { conversation: { userId: user.id } },
       select: { name: true, color: true },
       distinct: ["name"],
       orderBy: { name: "asc" },
     });
-    // Also get the count of conversations per tag.
     const counts = await db.conversationTag.groupBy({
       by: ["name"],
+      where: { conversation: { userId: user.id } },
       _count: true,
     });
     const countMap = new Map(counts.map((c) => [c.name, c._count]));
@@ -31,13 +33,18 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
       tags: tags.map((t) => ({ name: t.name, color: t.color, count: countMap.get(t.name) || 0 })),
     });
   }
-  // Otherwise return tags for a specific conversation.
+  const owned = await ownedConversation(user.id, id);
+  if (!owned) return NextResponse.json({ error: "not found" }, { status: 404 });
   const tags = await db.conversationTag.findMany({ where: { conversationId: id }, orderBy: { name: "asc" } });
   return NextResponse.json({ tags });
 }
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
   const { id } = await ctx.params;
+  const owned = await ownedConversation(user.id, id);
+  if (!owned) return NextResponse.json({ error: "not found" }, { status: 404 });
   const body = await req.json().catch(() => ({}));
   const name = String(body.name || "").trim().toLowerCase().replace(/\s+/g, "-").slice(0, 24);
   if (!name) return NextResponse.json({ error: "name required" }, { status: 400 });
@@ -48,7 +55,6 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     });
     return NextResponse.json({ ok: true, tag });
   } catch (e: any) {
-    // unique constraint → tag already exists on this conversation
     if (String(e?.code || "").includes("P2002")) {
       return NextResponse.json({ ok: true, error: "already tagged" });
     }
@@ -57,7 +63,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 }
 
 export async function DELETE(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
   const { id } = await ctx.params;
+  const owned = await ownedConversation(user.id, id);
+  if (!owned) return NextResponse.json({ error: "not found" }, { status: 404 });
   const url = new URL(req.url);
   const name = url.searchParams.get("name");
   if (!name) return NextResponse.json({ error: "name query param required" }, { status: 400 });

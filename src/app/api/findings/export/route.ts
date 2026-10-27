@@ -4,10 +4,14 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { isSessionUser, requireUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 
+
 export async function POST(req: NextRequest) {
+  const user = requireUser(req);
+  if (!isSessionUser(user)) return user;
   let body: { conversationId?: string; format?: string; includeFalsePositives?: boolean };
   try {
     body = await req.json();
@@ -19,8 +23,8 @@ export async function POST(req: NextRequest) {
   const includeFP = body.includeFalsePositives !== false; // default true
   if (!conversationId) return NextResponse.json({ error: "conversationId required" }, { status: 400 });
 
-  const conv = await db.conversation.findUnique({
-    where: { id: conversationId },
+  const conv = await db.conversation.findFirst({
+    where: { id: conversationId, userId: user.id },
     include: {
       findings: {
         where: includeFP ? {} : { falsePositive: false },
