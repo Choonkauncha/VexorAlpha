@@ -1,7 +1,5 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
-# dependencies
-node_modules
+# Dependencies
+/node_modules
 /.pnp
 .pnp.*
 .yarn/*
@@ -10,47 +8,40 @@ node_modules
 !.yarn/releases
 !.yarn/versions
 
-# testing
+# Testing & Playwright
 /coverage
+/playwright-report/
+/test-results/
 
-# next.js
+# Next.js build output
 /.next/
 /out/
-
-# production
 /build
 
-# misc
-.DS_Store
-*.pem
+# Environment variables
+.env*
+!.env.example
 
-# debug
+# Vercel
+.vercel
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Logs & temporary files
+*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+*.tmp
+*.bak
+.DS_Store
+*.pem
 
-# env files (can opt-in for committing if needed)
-.env*
-
-# vercel
-.vercel
-
-
-# typescript
-*.tsbuildinfo
-next-env.d.ts
-local-*
-.claude
-.z-ai-config
-*.log
-dev.log
-dev.out.log
-test
-prompt
-
-server.log
-# Skills directory
-/skills/
-/playwright-report/
-/test-results/
+# Local editor / assistant state
+.cursor/
+.claude/
+AGENTS.md
+CLAUDE.md

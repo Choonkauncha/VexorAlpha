@@ -1,90 +1,57 @@
 # Vexor
 
-Next.js workspace for authorized security reviews, with multi-tenant authentication,
-per-user database isolation, saved conversations, findings, reports, provider settings,
-and a responsive chat interface.
+Next.js security engineering workspace for authorized security assessments, featuring multi-tenant authentication, per-workspace database isolation, findings management, exploit verification tracking, and an interactive reconnaissance and code-audit console.
 
-Live alpha: https://vexoralpha.vercel.app/
+**Live Application:** [https://vexoralpha.vercel.app](https://vexoralpha.vercel.app/)
 
-## Authentication & tenant isolation
+## Key Capabilities
 
-Vexor ships with session/JWT authentication (httpOnly `vexor_session` cookie) and
-strict per-user / per-workspace database isolation:
+- **Multi-Tenant Authentication & Isolation:** Session authentication (`httpOnly` HMAC-signed `vexor_session` cookie) with strict per-user and per-workspace PostgreSQL isolation across `Conversation`, `Message`, `Finding`, `Exploit`, `ToolCall`, and `Setting` records.
+- **One-Click Isolated Sandbox:** Instant provisioning of an isolated `investor-<uuid>` tenant workspace for zero-credential evaluation without a login wall.
+- **Security Assessment Engine:** 16 server-side reconnaissance, HTTP/TLS inspection, header/CORS auditing, CVE lookup, and static analysis tools gated by authorized target scope and SSRF protections.
+- **Findings Vault & Triage:** Severity timeline, duplicate detection, false-positive marking, bulk triage, and structured Markdown/JSON report exports.
+- **Multi-Provider Runtime & BYOK:** Server-side model routing with automatic fallback chains and optional per-tenant Bring-Your-Own-Key (BYOK) configuration isolated to the active workspace.
 
-- **Sign Up / Sign In** with email + password for named accounts.
-- **Launch Isolated Investor Sandbox** — one-click provisioning of a fresh
-  `investor-<uuid>` tenant with its own private workspace ID. Designed for
-  YC / a16z Speedrun / Rev1 reviewers so they are never blocked by a login wall.
-- Header **workspace badge** shows the active user / tenant, with
-  **Switch Account**, **Sign Out**, and **New Isolated Workspace**.
-- Every `Conversation`, `Message`, `Finding`, `Exploit`, `ToolCall`, `Setting`,
-  and BYOK provider key is scoped to the authenticated `userId` / `workspaceId`.
-  User A cannot read, mutate, or delete User B's records.
-- API keys entered in Settings are stored only on that tenant's Setting rows
-  (never leaked across users). Server env keys remain as a shared fallback for demos.
+## Getting Started
 
-Set `AUTH_SECRET` (min 16 chars) in the environment — used to sign session tokens.
-
-## Local setup
-
-Use Node.js 20.9 or newer and npm. The npm lockfile is the maintained install source.
+Requires Node.js 20.9+ and npm.
 
 ```sh
 npm ci
 cp .env.example .env
 ```
 
-Set `DATABASE_URL` to your PostgreSQL connection and `DATABASE_URL_UNPOOLED`
-to its direct connection. Set `AUTH_SECRET`. Set at least one provider key from
-`.env.example`. Keys belong on the server, never in `NEXT_PUBLIC_*` variables.
+Configure the required environment variables in `.env`:
 
-For a new development database, initialize the schema explicitly:
+- `DATABASE_URL` — Pooled PostgreSQL connection string
+- `DATABASE_URL_UNPOOLED` — Direct PostgreSQL connection string (used by Prisma schema operations)
+- `AUTH_SECRET` — Secret used to sign session tokens (minimum 16 characters)
+- At least one LLM provider key from `.env.example` (`GOOGLE_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`)
+
+Initialize the development database schema and start the local server:
 
 ```sh
 npm run db:push
 npm run dev
 ```
 
-Review database changes before applying them to an existing database. Installation
-and builds generate Prisma Client but do not modify the database schema.
-
-## Checks and production build
+## Verification & Production Build
 
 ```sh
 npm run lint
 npm run typecheck
+npm test
 npm run build
 npm start
 ```
 
-The production server uses Node and the standalone output. Production builds
-fail on TypeScript errors. No Bun installation is required.
-
-## Browser regression tests
+End-to-end Playwright suite (desktop and mobile Chromium):
 
 ```sh
 npx playwright install chromium
 npm run test:e2e
 ```
 
-The suite starts its own local server on port 3001 and runs on desktop and mobile
-Chromium. Workspace responses are mocked to check UI behavior deterministically:
-connection errors, navigation, failed saves, duplicate sends, draft preservation,
-and ID-based message truncation. Settings validation calls the real local route.
-These checks do not prove live provider access or PostgreSQL persistence.
-
 ## Deployment
 
-Deploy to Vercel with `DATABASE_URL`, `DATABASE_URL_UNPOOLED`, `AUTH_SECRET`,
-and at least one model-provider key configured. After schema changes, run
-`npx prisma db push` (or migrate) against the production database before
-or immediately after deploy.
-
-## Architecture notes
-
-- Next.js App Router + Prisma/Postgres
-- Agent loop with 16 defensive security tools, gated by authorized target scope
-- Per-tenant settings (provider, model, theme, scope, runtime, BYOK keys)
-- Playwright desktop/mobile e2e suite
-
-No shared-workspace mode remains: unauthenticated API calls return 401.
+Deploy to Vercel with `DATABASE_URL`, `DATABASE_URL_UNPOOLED`, `AUTH_SECRET`, and at least one model provider key configured in the project environment.
