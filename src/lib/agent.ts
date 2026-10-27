@@ -8,22 +8,63 @@ import { SYSTEM_PROMPT } from "./system-prompt";
 import { runTool, scanToolOutput } from "./security-tools";
 import { makeExploitEntry, mergeExploit } from "./exploits";
 import { mergeFindings } from "./findings";
-import type { AgentEvent, ChatMessage } from "./types";
+import { requestContext } from "./request-context";
+import { DEFAULT_RUNTIME_PARAMS, type AgentEvent, type ChatMessage } from "./types";
 
-const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
 const TOOL_CALL_RE_SINGLE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/;
 const MAX_OUTPUT_CHARS = 5000;
 
-interface LoopDeps {
+export interface LoopDeps {
   conversationId: string;
   history: ChatMessage[];   // prior messages (user + assistant), no system prompt
   provider: string;
   model: string;
   scope: string;            // authorized target scope
   maxIterations: number;
+  minActions?: number;
+  reflectEvery?: number;
   thinkingBudget: number;
   temperature: number | null;
   signal?: AbortSignal;
+}
+
+async function resolveRuntimeCadence(
+  conversationId: string,
+  explicitMinActions: number | undefined,
+  explicitReflectEvery: number | undefined,
+): Promise<{ minActions: number; reflectEvery: number }> {
+  if (explicitMinActions !== undefined && explicitReflectEvery !== undefined) {
+    return {
+      minActions: Math.max(0, Math.floor(explicitMinActions)),
+      reflectEvery: Math.max(0, Math.floor(explicitReflectEvery)),
+    };
+  }
+  let minActions = explicitMinActions ?? DEFAULT_RUNTIME_PARAMS.minActions;
+  let reflectEvery = explicitReflectEvery ?? DEFAULT_RUNTIME_PARAMS.reflectEvery;
+  try {
+    let userId = requestContext.getStore()?.userId;
+    if (!userId && conversationId) {
+      const conv = await db.conversation.findUnique({ where: { id: conversationId }, select: { userId: true } });
+      userId = conv?.userId ?? undefined;
+    }
+    if (userId) {
+      const rows = await db.setting.findMany({
+        where: { userId, key: { in: ["agent_min_actions", "agent_reflect_every"] } },
+      });
+      for (const r of rows) {
+        const n = Number(r.value);
+        if (!Number.isFinite(n)) continue;
+        if (r.key === "agent_min_actions" && explicitMinActions === undefined) minActions = n;
+        if (r.key === "agent_reflect_every" && explicitReflectEvery === undefined) reflectEvery = n;
+      }
+    }
+  } catch {
+    // Fall back to defaults when running outside DB context.
+  }
+  return {
+    minActions: Math.max(0, Math.floor(minActions)),
+    reflectEvery: Math.max(0, Math.floor(reflectEvery)),
+  };
 }
 
 // Sanitize messages for the API: strip display-only metadata.
@@ -107,7 +148,7 @@ function tryParseLenient(raw: string): any | null {
 }
 
 // Parse the first <tool_call> block out of a model response (single-call compat).
-function extractToolCall(text: string): { name: string; arguments: Record<string, unknown> } | null {
+export function extractToolCall(text: string): { name: string; arguments: Record<string, unknown> } | null {
   const m = text.match(TOOL_CALL_RE_SINGLE);
   if (!m) return null;
   const parsed = tryParseLenient(m[1].trim());
@@ -206,6 +247,10 @@ export async function* runAgentLoop(deps: LoopDeps): AsyncGenerator<AgentEvent> 
     yield { type: "error", content: "No configured AI providers. Set an API key or configure Z.ai before starting a chat." };
     return;
   }
+  const resolvedCadence = await resolveRuntimeCadence(conversationId, deps.minActions, deps.reflectEvery);
+  const minActions = Math.min(resolvedCadence.minActions, Math.max(0, maxIterations - 1));
+  const reflectEvery = resolvedCadence.reflectEvery;
+
   let activeProvider: ProviderId = providers[0];
   const activeModels = new Map<ProviderId, string>();
 
@@ -222,7 +267,11 @@ Network tools (dns_lookup, tls_inspect, fingerprint_web_tech, discover_paths, an
       : `=== AUTHORIZATION STATUS: NO SCOPE ===
 No authorized target scope is set. Network tools (dns_lookup, tls_inspect, fingerprint_web_tech, discover_paths, analyze_js_bundles, http_probe, analyze_security_headers, test_cors) will REFUSE to run. Tell the user to set a scope in Settings → Target scope (or enable "Allow All") before running network recon. You can still use non-network tools (jwt_inspect, identify_hash, transform_payload, generate_attack_payloads, cve_lookup, fetch_webpage, catalog_exploit).`;
 
-  const dynamicSystemPrompt = SYSTEM_PROMPT + "\n\n" + scopeInfo;
+  const cadenceInfo = minActions > 0
+    ? `\n\n=== THOROUGHNESS POLICY ===\nYou must complete at least ${minActions} tool action(s) before calling final_message.`
+    : "";
+
+  const dynamicSystemPrompt = SYSTEM_PROMPT + "\n\n" + scopeInfo + cadenceInfo;
 
   // Working message list (system + history). Tool results are appended as
   // assistant messages describing what happened, since the SDK doesn't expose
@@ -235,6 +284,7 @@ No authorized target scope is set. Network tools (dns_lookup, tls_inspect, finge
   // === Autonomous loop state ===
   let textOnlyStreak = 0;          // consecutive turns with no tool_call
   let actionCount = 0;             // total real tool actions (not text-only)
+  let lastReflectedAt = 0;         // actionCount at which the last reflection checkpoint fired
   const recentToolCalls: string[] = [];  // for repetition detection (name + args hash)
 
   for (let iter = 0; iter < maxIterations; iter++) {
@@ -244,13 +294,13 @@ No authorized target scope is set. Network tools (dns_lookup, tls_inspect, finge
     }
 
     // Emit a progress event so the UI can show "turn N of M" + action count.
-    yield { type: "progress", iteration: iter, maxIterations, actionCount } as any;
+    yield { type: "progress", iteration: iter, maxIterations, actionCount };
 
     let fullText = "";
     let reasoning = "";
     let firstChunk = true;
 
-    console.log(`[agent] iter ${iter} — calling LLM (thinking=${thinkingBudget > 0 ? "enabled" : "disabled"}, temp=${temperature}, msgs=${messages.length}, actions=${actionCount}, textOnlyStreak=${textOnlyStreak})`);
+    console.log(`[agent] iter ${iter} — calling LLM (thinking=${thinkingBudget > 0 ? "enabled" : "disabled"}, temp=${temperature}, msgs=${messages.length}, actions=${actionCount}/${minActions}, reflectEvery=${reflectEvery}, textOnlyStreak=${textOnlyStreak})`);
     const callStart = Date.now();
     try {
       let completed = false;
@@ -333,17 +383,20 @@ No authorized target scope is set. Network tools (dns_lookup, tls_inspect, finge
     if (allCalls.length === 0) {
       // === NO TOOL CALL — autonomous loop continuation ===
       textOnlyStreak++;
-      console.log(`[agent] no tool_call — textOnlyStreak=${textOnlyStreak}`);
+      console.log(`[agent] no tool_call — textOnlyStreak=${textOnlyStreak}, actions=${actionCount}/${minActions}`);
 
-      if (textOnlyStreak >= 2) {
+      const streakLimit = actionCount < minActions ? 3 : 2;
+      if (textOnlyStreak >= streakLimit) {
         yield { type: "done", content: visibleText };
         return;
       }
 
       const isReport = /#\s*\[Security Audit/i.test(visibleText);
-      const nudge = isReport
-        ? "You emitted a final report. Now call final_message to formally end the audit:\n\n<tool_call>\n{\"name\": \"final_message\", \"arguments\": {}}\n</tool_call>"
-        : "You emitted a response WITHOUT a tool_call. You MUST call a tool every turn. If the audit is complete, emit your report and call final_message. Otherwise, call the next tool to continue the audit. Do NOT emit prose-only responses.";
+      const nudge = actionCount < minActions
+        ? `You emitted a response WITHOUT a tool_call, and you have only completed ${actionCount} of the required minimum ${minActions} tool action(s). Call another tool now to continue probing before concluding.`
+        : isReport
+          ? "You emitted a final report. Now call final_message to formally end the audit:\n\n<tool_call>\n{\"name\": \"final_message\", \"arguments\": {}}\n</tool_call>"
+          : "You emitted a response WITHOUT a tool_call. You MUST call a tool every turn. If the audit is complete, emit your report and call final_message. Otherwise, call the next tool to continue the audit. Do NOT emit prose-only responses.";
 
       messages.push({ role: "assistant", content: fullText });
       messages.push({ role: "user", content: nudge });
@@ -367,8 +420,14 @@ No authorized target scope is set. Network tools (dns_lookup, tls_inspect, finge
       // Emit the tool-call event for the UI.
       yield { type: "tool_call", name, arguments: JSON.stringify(toolArgs) };
 
-      // final_message → end the loop immediately.
+      // final_message → end the loop immediately unless minActions is not yet met.
       if (name === "final_message") {
+        if (actionCount < minActions && iter < maxIterations - 1) {
+          const minActionsMsg = `Cannot finish yet: only ${actionCount} of ${minActions} required minimum tool action(s) completed. Continue probing untested endpoints, headers, or parameters before calling final_message.`;
+          yield { type: "tool_output", name, arguments: "{}", content: minActionsMsg };
+          resultParts.push(`Tool ${name} rejected:\n${minActionsMsg}`);
+          continue;
+        }
         await persistMessage(conversationId, "assistant", visibleText, { kind: "tool", toolName: name });
         yield { type: "tool_output", name, arguments: "{}", content: "Audit complete — final report delivered." };
         yield { type: "done", content: visibleText };
@@ -418,9 +477,21 @@ No authorized target scope is set. Network tools (dns_lookup, tls_inspect, finge
     const repetitionNudge = recentToolCalls.length >= 3 && recentToolCalls.filter((k) => k === recentToolCalls[recentToolCalls.length - 1]).length >= 3
       ? `\n\n⚠ You have repeated the same tool call. Try a DIFFERENT tool, a different endpoint, or move to the next phase of the audit.`
       : "";
+
+    let reflectionNudge = "";
+    if (reflectEvery > 0 && actionCount - lastReflectedAt >= reflectEvery) {
+      lastReflectedAt = actionCount;
+      yield {
+        type: "reasoning",
+        content: `Self-reflection checkpoint (${actionCount} actions completed): reviewing coverage, confirmed findings, and remaining high-priority attack vectors.`,
+      };
+      reflectionNudge = `\n\n[Reflection Checkpoint — ${actionCount} actions completed]: Pause to self-review before your next tool call: (1) summarize what attack surfaces and hypotheses you have verified so far, (2) check whether you are drifting or repeating low-yield probes, and (3) pick the highest-impact untested vector next.`;
+    }
+
+    const minActionsStatus = minActions > 0 ? ` (minimum required: ${minActions})` : "";
     messages.push({
       role: "user",
-      content: `${resultParts.join("\n\n---\n\n")}\n\nProgress: ${actionCount} tool action(s) completed (turn ${iter + 1}/${maxIterations}).${repetitionNudge}\n\nContinue the audit. Call the next tool. If you have confirmed a vulnerability, call catalog_exploit now. If the audit is complete, emit your final report and call final_message.`,
+      content: `${resultParts.join("\n\n---\n\n")}\n\nProgress: ${actionCount} tool action(s) completed${minActionsStatus} (turn ${iter + 1}/${maxIterations}).${repetitionNudge}${reflectionNudge}\n\nContinue the audit. Call the next tool. If you have confirmed a vulnerability, call catalog_exploit now. If the audit is complete${minActions > 0 ? ` and at least ${minActions} tool action(s) have been run` : ""}, emit your final report and call final_message.`,
     });
   }
 

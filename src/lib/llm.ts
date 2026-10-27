@@ -130,6 +130,7 @@ async function* openAiCompatibleStream(
   const decoder = new TextDecoder();
   let buffer = "";
   while (true) {
+    if (signal?.aborted) break;
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
@@ -173,6 +174,7 @@ async function* googleStream(
   const decoder = new TextDecoder();
   let buffer = "";
   while (true) {
+    if (signal?.aborted) break;
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
@@ -196,9 +198,8 @@ async function* anthropicStream(
   const key = (byok("anthropic") || env("ANTHROPIC_API_KEY"))!;
   const base = env("ANTHROPIC_BASE_URL") || "https://api.anthropic.com/v1";
   const system = messages.find((message) => message.role === "system")?.content;
-  const response = await fetch(`${base}/messages`, {
+  const response = await fetchWithTimeout("anthropic", `${base.replace(/\/$/, "")}/messages`, {
     method: "POST",
-    signal,
     headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
     body: JSON.stringify({
       model,
@@ -209,7 +210,7 @@ async function* anthropicStream(
       ...(temperature !== null ? { temperature } : {}),
       ...(thinkingBudget > 0 ? { thinking: { type: "enabled", budget_tokens: thinkingBudget } } : {}),
     }),
-  });
+  }, signal);
   if (!response.ok) throw new ProviderError(`anthropic request failed (${response.status}): ${await response.text()}`, "anthropic", response.status);
   if (!response.body) throw new ProviderError("anthropic returned an empty response", "anthropic");
 
@@ -217,6 +218,7 @@ async function* anthropicStream(
   const decoder = new TextDecoder();
   let buffer = "";
   while (true) {
+    if (signal?.aborted) break;
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
@@ -255,6 +257,7 @@ export async function* createProviderStream(options: {
     });
     let buffer = "";
     for await (const chunk of completion as AsyncIterable<any>) {
+      if (signal?.aborted) break;
       if (typeof chunk === "string" || Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) {
         buffer += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
         const blocks = buffer.split("\n\n");

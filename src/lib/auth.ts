@@ -2,7 +2,7 @@
 // Email+password accounts and 1-click investor sandboxes share the same
 // signed httpOnly cookie (`vexor_session`). Every data row is scoped to userId.
 
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "./db";
 
@@ -46,10 +46,7 @@ function fromB64url(s: string): Buffer {
 
 function sign(payload: TokenPayload): string {
   const body = b64url(JSON.stringify(payload));
-  const sig = createHash("sha256").update(`${body}.${authSecret()}`).digest();
-  // HMAC-like: sha256(body + secret) is adequate for our short-lived opaque sessions;
-  // use a second pass with the secret as key material for integrity.
-  const mac = createHash("sha256").update(authSecret()).update(".").update(body).digest();
+  const mac = createHmac("sha256", authSecret()).update(body).digest();
   return `${body}.${b64url(mac)}`;
 }
 
@@ -57,7 +54,7 @@ function verify(token: string): TokenPayload | null {
   const parts = token.split(".");
   if (parts.length !== 2) return null;
   const [body, sig] = parts;
-  const expected = createHash("sha256").update(authSecret()).update(".").update(body).digest();
+  const expected = createHmac("sha256", authSecret()).update(body).digest();
   let given: Buffer;
   try {
     given = fromB64url(sig);

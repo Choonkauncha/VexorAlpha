@@ -1,11 +1,15 @@
 // Security tools — server-side implementations. All tools are read-only and
-// defensive. Network tools enforce an authorization-scope gate before running
-// against a live host.
+// defensive. Network tools enforce an authorization-scope gate and DNS-resolved
+// SSRF protection before running against a live host.
 
 import dns from "dns";
+import net from "net";
 import tls from "tls";
 import https from "https";
 import http from "http";
+import { existsSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 import { URL } from "url";
 import ZAI from "z-ai-web-dev-sdk";
 import { scanFindings } from "./findings";
@@ -85,7 +89,7 @@ export const TOOL_DEFS: ToolDef[] = [
   },
   {
     name: "cve_lookup",
-    description: "Look up CVE details via web search.",
+    description: "Look up CVE details via NVD / web search.",
     parameters: { id: { type: "string", description: "CVE id (e.g. CVE-2024-3094)", required: true } },
   },
   {
@@ -136,11 +140,186 @@ function assertHostAuthorized(host: string, scope: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP fetch helper (follows redirects, returns headers + body)
+// SSRF protection (loopback, RFC1918, link-local / cloud metadata, IPv6 local)
 // ---------------------------------------------------------------------------
-function fetchUrl(url: string, opts: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number } = {}): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string; finalUrl: string }> {
+const BLOCKED_HOSTNAMES = new Set([
+  "localhost",
+  "localhost.localdomain",
+  "ip6-localhost",
+  "ip6-loopback",
+  "metadata",
+  "metadata.google.internal",
+  "instance-data",
+]);
+
+function isPrivateOrReservedIpv4(ip: string): boolean {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return true;
+  const nums = parts.map((p) => Number(p));
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+  const [a, b, c] = nums;
+  if (a === 0) return true; // 0.0.0.0/8 current network
+  if (a === 10) return true; // 10.0.0.0/8 RFC1918
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT / cloud metadata
+  if (a === 127) return true; // 127.0.0.0/8 loopback
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local & 169.254.169.254 metadata
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // 192.0.0.0/24, 192.0.2.0/24
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16 RFC1918
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking
+  if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24 TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24 TEST-NET-3
+  if (a >= 224) return true; // 224.0.0.0/4 multicast & 240.0.0.0/4 reserved/broadcast
+  return false;
+}
+
+export function isPrivateOrReservedIp(rawIp: string): boolean {
+  const cleaned = rawIp.trim().replace(/^\[|\]$/g, "").split("%")[0].toLowerCase();
+  if (!cleaned) return true;
+
+  const version = net.isIP(cleaned);
+  if (version === 4) {
+    return isPrivateOrReservedIpv4(cleaned);
+  }
+  if (version === 6) {
+    if (cleaned === "::" || cleaned === "::1" || cleaned === "0:0:0:0:0:0:0:0" || cleaned === "0:0:0:0:0:0:0:1") {
+      return true;
+    }
+    // IPv4-mapped IPv6 in dotted quad form (e.g. ::ffff:127.0.0.1 or ::ffff:169.254.169.254)
+    if (cleaned.startsWith("::ffff:")) {
+      const tail = cleaned.slice("::ffff:".length);
+      if (net.isIP(tail) === 4) {
+        return isPrivateOrReservedIpv4(tail);
+      }
+      // Hex form ::ffff:7f00:1
+      const hexParts = tail.split(":");
+      if (hexParts.length === 2) {
+        const hi = parseInt(hexParts[0], 16);
+        const lo = parseInt(hexParts[1], 16);
+        if (!Number.isNaN(hi) && !Number.isNaN(lo)) {
+          const v4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+          return isPrivateOrReservedIpv4(v4);
+        }
+      }
+    }
+    // Unique local (fc00::/7 -> fc.. or fd..)
+    if (cleaned.startsWith("fc") || cleaned.startsWith("fd")) return true;
+    // Link-local (fe80::/10 -> fe8, fe9, fea, feb) and site-local (fec0::/10)
+    if (/^fe[89abcef]/.test(cleaned)) return true;
+    // Multicast (ff00::/8)
+    if (cleaned.startsWith("ff")) return true;
+    // Documentation (2001:db8::/32)
+    if (cleaned.startsWith("2001:db8:") || cleaned.startsWith("2001:0db8:")) return true;
+    return false;
+  }
+  return true;
+}
+
+export async function assertSafeTargetHost(rawHost: string): Promise<string[]> {
+  const host = rawHost.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  if (!host) {
+    throw new Error("SSRF protection: empty target host.");
+  }
+  if (
+    BLOCKED_HOSTNAMES.has(host) ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal")
+  ) {
+    throw new Error(`SSRF protection: blocked internal hostname "${host}".`);
+  }
+
+  if (net.isIP(host)) {
+    if (isPrivateOrReservedIp(host)) {
+      throw new Error(`SSRF protection: blocked private or reserved IP "${host}".`);
+    }
+    return [host];
+  }
+
+  let records: dns.LookupAddress[];
+  try {
+    records = await dns.promises.lookup(host, { all: true, verbatim: true });
+  } catch (e: any) {
+    throw new Error(`DNS resolution failed for "${host}": ${e.message}`);
+  }
+  if (!records || records.length === 0) {
+    throw new Error(`DNS resolution returned no addresses for "${host}".`);
+  }
+  for (const rec of records) {
+    if (isPrivateOrReservedIp(rec.address)) {
+      throw new Error(
+        `SSRF protection: host "${host}" resolved to blocked private/reserved IP "${rec.address}".`,
+      );
+    }
+  }
+  return records.map((r) => r.address);
+}
+
+async function assertSafeTargetUrl(rawUrl: string): Promise<URL> {
+  let u: URL;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    throw new Error(`Invalid URL: "${rawUrl}"`);
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error(`SSRF protection: unsupported protocol "${u.protocol}" (only http: and https: are allowed).`);
+  }
+  await assertSafeTargetHost(u.hostname);
+  return u;
+}
+
+const safeDnsLookup: net.LookupFunction = (hostname, options, callback) => {
+  dns.lookup(hostname, options as any, (err, address, family) => {
+    if (err) return callback(err, address as any, family);
+    if (Array.isArray(address)) {
+      for (const item of address) {
+        if (isPrivateOrReservedIp(item.address)) {
+          return callback(
+            new Error(`SSRF protection: blocked private/reserved IP "${item.address}" for "${hostname}".`),
+            [] as any,
+            family,
+          );
+        }
+      }
+      return callback(null, address as any, family);
+    }
+    if (typeof address === "string" && isPrivateOrReservedIp(address)) {
+      return callback(
+        new Error(`SSRF protection: blocked private/reserved IP "${address}" for "${hostname}".`),
+        "" as any,
+        family,
+      );
+    }
+    return callback(null, address as any, family);
+  });
+};
+
+function isZaiConfigured(): boolean {
+  const key = process.env.ZAI_API_KEY?.trim();
+  if (key) return true;
+  return [
+    join(process.cwd(), ".z-ai-config"),
+    join(homedir(), ".z-ai-config"),
+    "/etc/.z-ai-config",
+  ].some((p) => {
+    try {
+      return existsSync(p);
+    } catch {
+      return false;
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// HTTP fetch helper (validates SSRF on initial + redirect hops, returns headers + body)
+// ---------------------------------------------------------------------------
+export async function fetchUrl(
+  url: string,
+  opts: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number } = {},
+): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string; finalUrl: string }> {
+  const u = await assertSafeTargetUrl(url);
   return new Promise((resolve, reject) => {
-    const u = new URL(url);
     const lib = u.protocol === "https:" ? https : http;
     const req = lib.request(
       {
@@ -148,6 +327,7 @@ function fetchUrl(url: string, opts: { method?: string; headers?: Record<string,
         hostname: u.hostname,
         port: u.port || (u.protocol === "https:" ? 443 : 80),
         path: u.pathname + u.search,
+        lookup: safeDnsLookup,
         headers: {
           "User-Agent": "Vexor-Audit/1.0 (defensive-security; +https://vexor.local)",
           ...opts.headers,
@@ -156,11 +336,17 @@ function fetchUrl(url: string, opts: { method?: string; headers?: Record<string,
       },
       (res) => {
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          let loc = res.headers.location as string;
-          if (loc.startsWith("/")) loc = `${u.protocol}//${u.host}${loc}`;
-          // follow up to 5 redirects
-          if ((opts as any)._depth >= 5) return reject(new Error("Too many redirects"));
-          return resolve(fetchUrl(loc, { ...opts, _depth: ((opts as any)._depth || 0) + 1 } as any));
+          res.resume();
+          const depth = ((opts as any)._depth || 0) + 1;
+          if (depth > 5) return reject(new Error("Too many redirects"));
+          let nextUrl: string;
+          try {
+            nextUrl = new URL(String(res.headers.location), url).href;
+          } catch {
+            return reject(new Error("Invalid redirect location"));
+          }
+          fetchUrl(nextUrl, { ...opts, _depth: depth } as any).then(resolve, reject);
+          return;
         }
         const chunks: Buffer[] = [];
         res.on("data", (c) => chunks.push(c as Buffer));
@@ -202,32 +388,36 @@ async function dnsLookup(args: { host: string }): Promise<string> {
 }
 
 async function tlsInspect(args: { host: string; port?: number }, scope: string): Promise<string> {
-  const host = String(args.host || "").trim().replace(/^https?:\/\//, "");
+  const host = String(args.host || "").trim().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
   const port = Number(args.port || 443);
   if (!host) return "Error: host required";
   assertHostAuthorized(host, scope);
+  await assertSafeTargetHost(host);
   return new Promise((resolve) => {
-    const sock = tls.connect({ host, port, servername: host, rejectUnauthorized: false }, () => {
-      const cert = sock.getPeerCertificate();
-      const proto = sock.getProtocol();
-      const cipher = sock.getCipher();
-      const lines: string[] = [`TLS inspection for ${host}:${port}`, ""];
-      lines.push(`Protocol: ${proto || "unknown"}`);
-      lines.push(`Cipher: ${cipher ? `${cipher.name} (${cipher.version})` : "unknown"}`);
-      lines.push(`Authorized: ${sock.authorized ? "valid chain" : "INVALID / self-signed / chain broken"}`);
-      if (cert && Object.keys(cert).length) {
-        lines.push("");
-        lines.push(`Subject: ${cert.subject ? JSON.stringify(cert.subject) : "n/a"}`);
-        lines.push(`Issuer: ${cert.issuer ? JSON.stringify(cert.issuer) : "n/a"}`);
-        lines.push(`Valid from: ${cert.valid_from}`);
-        lines.push(`Valid to:   ${cert.valid_to}`);
-        const daysLeft = Math.round((new Date(cert.valid_to).getTime() - Date.now()) / 86400000);
-        lines.push(`Days remaining: ${daysLeft}`);
-        lines.push(`SAN: ${cert.subjectaltname || "none"}`);
-      }
-      sock.end();
-      resolve(lines.join("\n"));
-    });
+    const sock = tls.connect(
+      { host, port, servername: host, rejectUnauthorized: false, lookup: safeDnsLookup },
+      () => {
+        const cert = sock.getPeerCertificate();
+        const proto = sock.getProtocol();
+        const cipher = sock.getCipher();
+        const lines: string[] = [`TLS inspection for ${host}:${port}`, ""];
+        lines.push(`Protocol: ${proto || "unknown"}`);
+        lines.push(`Cipher: ${cipher ? `${cipher.name} (${cipher.version})` : "unknown"}`);
+        lines.push(`Authorized: ${sock.authorized ? "valid chain" : "INVALID / self-signed / chain broken"}`);
+        if (cert && Object.keys(cert).length) {
+          lines.push("");
+          lines.push(`Subject: ${cert.subject ? JSON.stringify(cert.subject) : "n/a"}`);
+          lines.push(`Issuer: ${cert.issuer ? JSON.stringify(cert.issuer) : "n/a"}`);
+          lines.push(`Valid from: ${cert.valid_from}`);
+          lines.push(`Valid to:   ${cert.valid_to}`);
+          const daysLeft = Math.round((new Date(cert.valid_to).getTime() - Date.now()) / 86400000);
+          lines.push(`Days remaining: ${daysLeft}`);
+          lines.push(`SAN: ${cert.subjectaltname || "none"}`);
+        }
+        sock.end();
+        resolve(lines.join("\n"));
+      },
+    );
     sock.setTimeout(10000, () => {
       sock.destroy(new Error("TLS connect timed out"));
     });
@@ -277,6 +467,7 @@ async function discoverPaths(args: { url: string }, scope: string): Promise<stri
   const url = String(args.url || "").trim().replace(/\/$/, "");
   if (!url) return "Error: url required";
   assertHostAuthorized(new URL(url).hostname, scope);
+  await assertSafeTargetUrl(url);
   const lines: string[] = [`Path discovery for ${url}`, ""];
   const results: string[] = [];
   // probe in batches of 6
@@ -505,40 +696,163 @@ function identifyHash(args: { value: string }): string {
   return lines.join("\n");
 }
 
+async function lookupCveFromNvd(queryId: string): Promise<string | null> {
+  const normalized = queryId.trim().toUpperCase();
+  const isCveId = /^CVE-\d{4}-\d{4,}$/.test(normalized);
+  const nvdUrl = isCveId
+    ? `https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${encodeURIComponent(normalized)}`
+    : `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(queryId)}&resultsPerPage=5`;
+
+  try {
+    const r = await fetchUrl(nvdUrl, {
+      headers: { Accept: "application/json" },
+      timeoutMs: 10000,
+    });
+    if (r.status === 200 && r.body) {
+      const parsed = JSON.parse(r.body);
+      const vulns = parsed?.vulnerabilities || [];
+      if (vulns.length > 0) {
+        const lines: string[] = [`CVE lookup (NVD): ${queryId}`, ""];
+        for (const item of vulns.slice(0, 5)) {
+          const cve = item?.cve;
+          if (!cve) continue;
+          const desc =
+            (cve.descriptions || []).find((d: any) => d.lang === "en")?.value ||
+            cve.descriptions?.[0]?.value ||
+            "No description available.";
+          const m31 = cve.metrics?.cvssMetricV31?.[0]?.cvssData;
+          const m30 = cve.metrics?.cvssMetricV30?.[0]?.cvssData;
+          const m2 = cve.metrics?.cvssMetricV2?.[0]?.cvssData;
+          const cvss = m31 || m30 || m2;
+          const scoreStr = cvss
+            ? `CVSS ${cvss.baseScore} (${cvss.baseSeverity || "N/A"}) ${cvss.vectorString || ""}`.trim()
+            : "CVSS: unrated";
+          lines.push(`• ${cve.id} — ${scoreStr}`);
+          if (cve.published) lines.push(`  Published: ${cve.published}`);
+          lines.push(`  ${desc}`);
+          const refs = (cve.references || []).slice(0, 3).map((ref: any) => ref.url).filter(Boolean);
+          for (const ref of refs) lines.push(`  Ref: ${ref}`);
+          lines.push("");
+        }
+        return lines.join("\n");
+      }
+    }
+  } catch {
+    /* fall through to MITRE fallback */
+  }
+
+  if (isCveId) {
+    try {
+      const mitreUrl = `https://cveawg.mitre.org/api/cve/${encodeURIComponent(normalized)}`;
+      const r = await fetchUrl(mitreUrl, {
+        headers: { Accept: "application/json" },
+        timeoutMs: 10000,
+      });
+      if (r.status === 200 && r.body) {
+        const data = JSON.parse(r.body);
+        const cveId = data?.cveMetadata?.cveId || normalized;
+        const published = data?.cveMetadata?.datePublished || "";
+        const cna = data?.containers?.cna;
+        const desc =
+          (cna?.descriptions || []).find((d: any) => d.lang === "en" || d.lang?.startsWith("en"))?.value ||
+          cna?.descriptions?.[0]?.value ||
+          "No description available.";
+        const lines: string[] = [`CVE lookup (MITRE): ${cveId}`, ""];
+        if (published) lines.push(`Published: ${published}`);
+        lines.push(desc);
+        const refs = (cna?.references || []).slice(0, 4).map((ref: any) => ref.url).filter(Boolean);
+        if (refs.length) {
+          lines.push("", "References:");
+          for (const ref of refs) lines.push(`  • ${ref}`);
+        }
+        return lines.join("\n");
+      }
+    } catch {
+      /* ignore and return null */
+    }
+  }
+
+  return null;
+}
+
 async function cveLookup(args: { id: string }): Promise<string> {
   const id = String(args.id || "").trim();
   if (!id) return "Error: id required";
-  try {
-    const zai = await ZAI.create();
-    const res = await zai.functions.invoke("web_search", { query: `${id} CVE CVSS details affected patched`, num: 5 });
-    const items = res || [];
-    if (!items.length) return `No results found for ${id}.`;
-    const lines: string[] = [`CVE lookup: ${id}`, ""];
-    for (const it of items) {
-      lines.push(`• ${it.name}`);
-      lines.push(`  ${it.url}`);
-      lines.push(`  ${it.snippet}`);
-      lines.push("");
+
+  if (isZaiConfigured()) {
+    try {
+      const zai = await ZAI.create();
+      const res = await zai.functions.invoke("web_search", { query: `${id} CVE CVSS details affected patched`, num: 5 });
+      const items = res || [];
+      if (items.length) {
+        const lines: string[] = [`CVE lookup: ${id}`, ""];
+        for (const it of items) {
+          lines.push(`• ${it.name}`);
+          lines.push(`  ${it.url}`);
+          lines.push(`  ${it.snippet}`);
+          lines.push("");
+        }
+        return lines.join("\n");
+      }
+    } catch {
+      /* fall back to native NVD/MITRE lookup */
     }
-    return lines.join("\n");
-  } catch (e: any) {
-    return `CVE lookup failed: ${e.message}`;
   }
+
+  const nativeResult = await lookupCveFromNvd(id);
+  if (nativeResult) return nativeResult;
+  return `No results found for ${id}.`;
+}
+
+function stripHtmlToText(html: string): { title: string; text: string } {
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = titleMatch ? titleMatch[1].replace(/\s+/g, " ").trim() : "";
+  const text = html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return { title, text };
 }
 
 async function fetchWebpage(args: { url: string }): Promise<string> {
   const url = String(args.url || "").trim();
   if (!url) return "Error: url required";
+
   try {
-    const zai = await ZAI.create();
-    const res = await zai.functions.invoke("page_reader", { url });
-    const data = res?.data;
-    if (!data) return `Failed to fetch ${url}.`;
-    const lines: string[] = [`Web page: ${data.title || url}`, `URL: ${data.url}`, ""];
-    if (data.publishedTime) lines.push(`Published: ${data.publishedTime}`, "");
-    // strip HTML tags for a compact text view
-    const text = (data.html || "").replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "").replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-    lines.push(text.slice(0, 4000));
+    await assertSafeTargetUrl(url);
+  } catch (e: any) {
+    return `Fetch failed: ${e.message}`;
+  }
+
+  if (isZaiConfigured()) {
+    try {
+      const zai = await ZAI.create();
+      const res = await zai.functions.invoke("page_reader", { url });
+      const data = res?.data;
+      if (data?.html) {
+        const lines: string[] = [`Web page: ${data.title || url}`, `URL: ${data.url || url}`, ""];
+        if (data.publishedTime) lines.push(`Published: ${data.publishedTime}`, "");
+        const { text } = stripHtmlToText(data.html);
+        lines.push(text.slice(0, 4000));
+        return lines.join("\n");
+      }
+    } catch {
+      /* fall back to native HTTP fetch */
+    }
+  }
+
+  try {
+    const r = await fetchUrl(url, { timeoutMs: 12000 });
+    const { title, text } = stripHtmlToText(r.body);
+    const lines: string[] = [
+      `Web page: ${title || url}`,
+      `URL: ${r.finalUrl || url}`,
+      `Status: ${r.status}`,
+      "",
+      text.slice(0, 4000),
+    ];
     return lines.join("\n");
   } catch (e: any) {
     return `Fetch failed: ${e.message}`;

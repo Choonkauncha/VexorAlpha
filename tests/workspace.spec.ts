@@ -1,17 +1,37 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { test, expect, type Page } from '@playwright/test';
+import { issueSessionToken, SESSION_COOKIE, type SessionUser } from '../src/lib/auth';
 
+if (!process.env.AUTH_SECRET) {
+  const envPath = path.join(process.cwd(), '.env');
+  if (fs.existsSync(envPath)) {
+    const match = fs.readFileSync(envPath, 'utf8').match(/^AUTH_SECRET=(.+)$/m);
+    if (match) process.env.AUTH_SECRET = match[1].trim().replace(/^["']|["']$/g, '');
+  }
+}
+
+const authUser: SessionUser = {
+  id: 'user-fixture',
+  workspaceId: 'user-fixture',
+  email: 'tester@vexor.dev',
+  displayName: 'tester',
+  kind: 'email',
+};
 const settings = { provider: 'openai', model: '', theme: 'dark', targetScope: '', runtime: { maxIterations: 40, minActions: 0, thinkingBudget: 0, temperature: null, reflectEvery: 0 } };
 const summary = { id: 'fixture', title: 'Saved review', pinned: false, favorited: false, archived: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), tags: [], messageCount: 2, findingCount: 0, exploitCount: 0 };
 const transcript = [{ id: 'user-1', role: 'user', content: 'Review my example', metadata: { kind: 'text' } }, { id: 'assistant-1', role: 'assistant', content: 'Example review response', metadata: { kind: 'text' } }];
+
 async function workspace(page: Page, conversations = [summary]) {
   await page.route('**/api/**', async route => {
-    const path = new URL(route.request().url()).pathname;
+    const pathname = new URL(route.request().url()).pathname;
     let body: unknown = {};
-    if (path === '/api/settings') body = settings;
-    if (path === '/api/conversations') body = conversations;
-    if (path === '/api/conversations/fixture') body = { messages: transcript, findings: [], exploits: [], toolCalls: [] };
-    if (path.endsWith('/tags')) body = { tags: [] };
-    if (path.endsWith('/duplicates')) body = { groups: [] };
+    if (pathname === '/api/auth/me' || pathname === '/api/auth/sandbox') body = { user: authUser };
+    if (pathname === '/api/settings') body = settings;
+    if (pathname === '/api/conversations') body = conversations;
+    if (pathname === '/api/conversations/fixture') body = { messages: transcript, findings: [], exploits: [], toolCalls: [] };
+    if (pathname.endsWith('/tags')) body = { tags: [] };
+    if (pathname.endsWith('/duplicates')) body = { groups: [] };
     await route.fulfill({ json: body });
   });
   await page.goto('/');
@@ -21,7 +41,13 @@ async function workspace(page: Page, conversations = [summary]) {
 test('API failure leaves the shell usable and the connection can recover', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
-  await page.route('**/api/**', route => route.fulfill({ status: 503, json: { error: 'Database unavailable.' } }));
+  await page.route('**/api/**', route => {
+    const pathname = new URL(route.request().url()).pathname;
+    if (pathname === '/api/auth/me') {
+      return route.fulfill({ json: { user: authUser } });
+    }
+    return route.fulfill({ status: 503, json: { error: 'Database unavailable.' } });
+  });
   await page.goto('/');
   await expect(page.getByRole('alert').filter({ hasText: 'Workspace unavailable' })).toContainText('Workspace unavailable');
   await page.getByRole('button', { name: 'Toggle sidebar' }).click();
@@ -103,9 +129,41 @@ test('clear failure retains the transcript; retry deletes by persisted message I
 });
 
 test('settings route rejects invalid input before touching the database', async ({ request }) => {
+  const token = issueSessionToken(authUser);
   for (const payload of [null, { runtime: { maxIterations: -1 } }, { theme: 'invalid' }]) {
-    const response = await request.put('/api/settings', { data: payload });
+    const response = await request.put('/api/settings', {
+      data: payload,
+      headers: { Cookie: `${SESSION_COOKIE}=${token}` },
+    });
     expect(response.status()).toBe(400);
     expect((await response.json()).error).toBeTruthy();
   }
+});
+
+test('unauthenticated boot shows auth modal and 1-click investor sandbox provisions workspace', async ({ page }) => {
+  const sandboxUser: SessionUser = {
+    id: 'sandbox-fixture',
+    workspaceId: 'sandbox-fixture',
+    email: null,
+    displayName: 'investor-deadbeef-cafebabe',
+    kind: 'sandbox',
+  };
+  await page.route('**/api/**', async route => {
+    const pathname = new URL(route.request().url()).pathname;
+    if (pathname === '/api/auth/me') {
+      return route.fulfill({ status: 401, json: { error: 'Authentication required.' } });
+    }
+    if (pathname === '/api/auth/sandbox') {
+      return route.fulfill({ json: { user: sandboxUser, message: 'Isolated investor sandbox ready.' } });
+    }
+    if (pathname === '/api/settings') return route.fulfill({ json: settings });
+    if (pathname === '/api/conversations') return route.fulfill({ json: [] });
+    return route.fulfill({ json: {} });
+  });
+  await page.goto('/');
+  const sandboxButton = page.getByRole('button', { name: /Launch Isolated Investor Sandbox/i });
+  await expect(sandboxButton).toBeVisible();
+  await sandboxButton.click();
+  await expect(sandboxButton).toHaveCount(0);
+  await expect(page.getByText('investor-deadbeef-cafebabe')).toBeVisible();
 });
